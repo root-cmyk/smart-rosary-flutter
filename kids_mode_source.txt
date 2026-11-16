@@ -1,0 +1,5271 @@
+﻿
+===== lib\navigation\auth_gate.dart =====
+
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/material.dart';
+
+import '../screens/auth_screen.dart';
+import '../screens/kids_mode_screen.dart';
+import 'main_navigation.dart';
+
+class AuthGate extends StatelessWidget {
+  const AuthGate({super.key});
+
+  Future<Map<String, dynamic>> _loadProfile(User user) async {
+    final snapshot = await FirebaseFirestore.instance
+        .collection('users')
+        .doc(user.uid)
+        .get();
+
+    if (!snapshot.exists) {
+      throw Exception(
+        'Your account profile is missing. '
+        'Please contact support before continuing.',
+      );
+    }
+
+    final data = snapshot.data();
+
+    if (data == null ||
+        (data['role'] != 'parent' && data['role'] != 'child')) {
+      throw Exception(
+        'Your account has an invalid role. '
+        'Please contact support.',
+      );
+    }
+
+    return data;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<User?>(
+      stream: FirebaseAuth.instance.authStateChanges(),
+      builder: (context, authSnapshot) {
+        if (authSnapshot.connectionState == ConnectionState.waiting) {
+          return const _LoadingScreen();
+        }
+
+        final user = authSnapshot.data;
+
+        if (user == null) {
+          return const AuthScreen();
+        }
+
+        return FutureBuilder<Map<String, dynamic>>(
+          key: ValueKey(user.uid),
+          future: _loadProfile(user),
+          builder: (context, profileSnapshot) {
+            if (profileSnapshot.connectionState ==
+                ConnectionState.waiting) {
+              return const _LoadingScreen();
+            }
+
+            if (profileSnapshot.hasError) {
+              return _MessageScreen(
+                message: 'Could not load your account profile.\n\n'
+                    '${profileSnapshot.error}',
+                onSignOut: () async {
+                  await FirebaseAuth.instance.signOut();
+                },
+              );
+            }
+
+            final profile = profileSnapshot.data!;
+            final role = profile['role'];
+
+            if (role == 'child') {
+              final accountType = profile['accountType'];
+
+              final parentUid = profile['parentUid'] as String?;
+              final childProfileId =
+                  profile['childProfileId'] as String?;
+
+              // A parent-managed child must have both linking fields.
+              if (accountType == 'parentManagedChild' &&
+                  (parentUid == null ||
+                      parentUid.isEmpty ||
+                      childProfileId == null ||
+                      childProfileId.isEmpty)) {
+                return _MessageScreen(
+                  message: 'Your child account is not properly linked '
+                      'to its parent profile. Please contact support.',
+                  onSignOut: () async {
+                    await FirebaseAuth.instance.signOut();
+                  },
+                );
+              }
+
+              return KidsModeScreen(
+                onExitKidsMode: () async {
+                  await FirebaseAuth.instance.signOut();
+                },
+                parentUid: parentUid,
+                childProfileId: childProfileId,
+              );
+            }
+
+            return const MainNavigation();
+          },
+        );
+      },
+    );
+  }
+}
+
+class _LoadingScreen extends StatelessWidget {
+  const _LoadingScreen();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Scaffold(
+      body: Center(
+        child: CircularProgressIndicator(),
+      ),
+    );
+  }
+}
+
+class _MessageScreen extends StatelessWidget {
+  final String message;
+  final Future<void> Function() onSignOut;
+
+  const _MessageScreen({
+    required this.message,
+    required this.onSignOut,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                message,
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 16),
+              FilledButton(
+                onPressed: onSignOut,
+                child: const Text('Sign out'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
+===== lib\navigation\main_navigation.dart =====
+
+import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+
+import '../screens/home_screen.dart';
+import '../screens/learn_screen.dart';
+import '../screens/pray_screen.dart';
+import '../screens/progress_screen.dart';
+import '../screens/profile_screen.dart';
+import '../screens/kids_mode_screen.dart';
+import '../widgets/liquid_navigation_bar.dart';
+
+class MainNavigation extends StatefulWidget {
+  const MainNavigation({super.key});
+
+  @override
+  State<MainNavigation> createState() => _MainNavigationState();
+}
+
+class _MainNavigationState extends State<MainNavigation> {
+  static const String _kidsModeKey = 'kids_mode_enabled';
+
+  int currentIndex = 0;
+  bool kidsModeEnabled = false;
+  bool preferencesLoaded = false;
+
+  // The selected child belonging to the signed-in parent.
+  String? selectedChildParentUid;
+  String? selectedChildProfileId;
+
+  static const adultDestinations = [
+    RosaryDestination(Icons.home_rounded, 'Home'),
+    RosaryDestination(Icons.auto_stories_rounded, 'Learn'),
+    RosaryDestination(Icons.favorite_rounded, 'Pray'),
+    RosaryDestination(Icons.insights_rounded, 'Progress'),
+    RosaryDestination(Icons.person_rounded, 'Profile'),
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadKidsMode();
+  }
+
+  Future<void> _loadKidsMode() async {
+    final preferences = await SharedPreferences.getInstance();
+
+    if (!mounted) return;
+
+    // Do not automatically reopen a parent's Kids Mode without
+    // knowing which child was selected.
+    final savedKidsMode = preferences.getBool(_kidsModeKey) ?? false;
+
+    setState(() {
+      kidsModeEnabled = false;
+      preferencesLoaded = true;
+    });
+
+    if (savedKidsMode) {
+      await preferences.setBool(_kidsModeKey, false);
+    }
+  }
+
+  Future<void> _setKidsMode(bool enabled) async {
+    if (enabled) {
+      // A parent must select a child before entering Kids Mode.
+      if (selectedChildParentUid == null ||
+          selectedChildProfileId == null) {
+        return;
+      }
+    }
+
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setBool(_kidsModeKey, enabled);
+
+    if (!mounted) return;
+
+    setState(() {
+      kidsModeEnabled = enabled;
+      currentIndex = 0;
+
+      if (!enabled) {
+        selectedChildParentUid = null;
+        selectedChildProfileId = null;
+      }
+    });
+  }
+
+  // Called by ProfileScreen after the parent selects a child.
+  Future<void> _enterKidsModeForChild(String childProfileId) async {
+    final user = FirebaseAuth.instance.currentUser;
+
+    if (user == null) return;
+
+    selectedChildParentUid = user.uid;
+    selectedChildProfileId = childProfileId;
+
+    await _setKidsMode(true);
+  }
+
+  void _navigateToTab(int index) {
+    if (index < 0 || index >= adultDestinations.length) return;
+
+    setState(() {
+      currentIndex = index;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!preferencesLoaded) {
+      return const Scaffold(
+        body: Center(
+          child: CircularProgressIndicator(),
+        ),
+      );
+    }
+
+    if (kidsModeEnabled) {
+      return KidsModeScreen(
+        onExitKidsMode: () => _setKidsMode(false),
+        parentUid: selectedChildParentUid,
+        childProfileId: selectedChildProfileId,
+      );
+    }
+
+    final screens = <Widget>[
+      HomeScreen(onNavigate: _navigateToTab),
+      const LearnScreen(),
+      const PrayScreen(),
+      const ProgressScreen(),
+      ProfileScreen(
+        kidsModeEnabled: kidsModeEnabled,
+        onKidsModeChanged: _setKidsMode,
+        onChildSelected: _enterKidsModeForChild,
+      ),
+    ];
+
+    return Scaffold(
+      extendBody: true,
+      body: IndexedStack(
+        index: currentIndex,
+        children: screens,
+      ),
+      bottomNavigationBar: LiquidNavigationBar(
+        currentIndex: currentIndex,
+        destinations: adultDestinations,
+        onChanged: _navigateToTab,
+      ),
+    );
+  }
+}
+
+
+===== lib\screens\auth_screen.dart =====
+
+import 'package:flutter/material.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+
+class AuthScreen extends StatefulWidget {
+  const AuthScreen({super.key});
+
+  @override
+  State<AuthScreen> createState() => _AuthScreenState();
+}
+
+class _AuthScreenState extends State<AuthScreen> {
+  final _formKey = GlobalKey<FormState>();
+
+  final _name = TextEditingController();
+  final _email = TextEditingController();
+  final _password = TextEditingController();
+
+  bool _registering = false;
+  bool _loading = false;
+  bool _hidePassword = true;
+
+  String _role = 'parent';
+
+  static const purple = Color(0xFF7654D6);
+  static const ink = Color(0xFF292343);
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _email.dispose();
+    _password.dispose();
+    super.dispose();
+  }
+
+  void _message(String message) {
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  String _normalizeUsername(String value) {
+    return value.trim().toLowerCase().replaceAll('@smartrosary.app', '');
+  }
+
+  bool _isValidUsername(String value) {
+    return value.length >= 3 &&
+        RegExp(r'^[a-z0-9._]+$').hasMatch(value);
+  }
+
+  String _getLoginEmail(String value) {
+    final input = value.trim().toLowerCase();
+
+    if (input.contains('@')) {
+      return input;
+    }
+
+    return '${_normalizeUsername(input)}@smartrosary.app';
+  }
+
+  Future<void> _submit() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    setState(() => _loading = true);
+
+    try {
+      final auth = FirebaseAuth.instance;
+      final firestore = FirebaseFirestore.instance;
+
+      final input = _email.text.trim();
+      final password = _password.text;
+
+      final loginEmail = _getLoginEmail(input);
+
+      if (_registering) {
+        final name = _name.text.trim();
+
+        final credential = await auth.createUserWithEmailAndPassword(
+          email: loginEmail,
+          password: password,
+        );
+
+        final user = credential.user!;
+
+        final profileData = <String, dynamic>{
+          'uid': user.uid,
+          'name': name,
+          'email': loginEmail,
+          'role': _role,
+          'accountType': _role == 'parent'
+              ? 'parent'
+              : 'independentChild',
+          'createdAt': FieldValue.serverTimestamp(),
+          'updatedAt': FieldValue.serverTimestamp(),
+        };
+
+        if (_role == 'child') {
+          profileData['username'] = _normalizeUsername(input);
+        }
+
+        await firestore
+            .collection('users')
+            .doc(user.uid)
+            .set(profileData);
+
+        await user.updateDisplayName(name);
+      } else {
+        await auth.signInWithEmailAndPassword(
+          email: loginEmail,
+          password: password,
+        );
+      }
+    } on FirebaseAuthException catch (e) {
+      _message(switch (e.code) {
+        'invalid-email' =>
+          'Enter a valid email address or username.',
+        'user-not-found' =>
+          'No account found. Check your email or username.',
+        'wrong-password' || 'invalid-credential' =>
+          'Email/username or password is incorrect.',
+        'email-already-in-use' =>
+          'That email or username already has an account.',
+        'weak-password' =>
+          'Use a stronger password (at least 6 characters).',
+        'too-many-requests' =>
+          'Too many attempts. Try again later.',
+        'network-request-failed' =>
+          'Check your internet connection.',
+        'operation-not-allowed' =>
+          'Email/password authentication is not enabled in Firebase.',
+        _ => e.message ?? 'Authentication failed. Please try again.',
+      });
+    } catch (e) {
+      _message(
+        'Could not complete the request. Check your connection and try again.',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _loading = false);
+      }
+    }
+  }
+
+  Future<void> _resetPassword() async {
+    final input = _email.text.trim();
+
+    if (input.isEmpty || !input.contains('@')) {
+      _message(
+        'Enter the real email address associated with your account.',
+      );
+      return;
+    }
+
+    try {
+      await FirebaseAuth.instance.sendPasswordResetEmail(
+        email: input.toLowerCase(),
+      );
+
+      _message(
+        'If an account exists for that email, a reset email will be sent.',
+      );
+    } on FirebaseAuthException catch (e) {
+      _message(e.message ?? 'Could not send the reset email.');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isChildRegistration = _registering && _role == 'child';
+
+    return Scaffold(
+      backgroundColor: const Color(0xFFF8F6FF),
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 430),
+              child: Form(
+                key: _formKey,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Container(
+                      height: 88,
+                      width: 88,
+                      alignment: Alignment.center,
+                      decoration: const BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: LinearGradient(
+                          colors: [
+                            Color(0xFFB9A4FF),
+                            purple,
+                          ],
+                        ),
+                      ),
+                      child: const Icon(
+                        Icons.auto_stories_rounded,
+                        color: Colors.white,
+                        size: 43,
+                      ),
+                    ),
+
+                    const SizedBox(height: 24),
+
+                    const Text(
+                      'SMART ROSARY',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: purple,
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: 2.5,
+                        fontSize: 13,
+                      ),
+                    ),
+
+                    const SizedBox(height: 10),
+
+                    Text(
+                      _registering
+                          ? 'Create your account'
+                          : 'Welcome back',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: ink,
+                        fontSize: 29,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+
+                    const SizedBox(height: 8),
+
+                    Text(
+                      _registering
+                          ? 'Begin your journey to learn, pray and grow.'
+                          : 'Continue your journey of prayer and faith.',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: Color(0xFF77718A),
+                        fontSize: 14,
+                      ),
+                    ),
+
+                    const SizedBox(height: 30),
+
+                    if (_registering) ...[
+                      const Text(
+                        'Your name',
+                        style: TextStyle(fontWeight: FontWeight.w700),
+                      ),
+
+                      const SizedBox(height: 8),
+
+                      TextFormField(
+                        controller: _name,
+                        textCapitalization: TextCapitalization.words,
+                        decoration: _decoration(
+                          'Enter your name',
+                          Icons.person_outline_rounded,
+                        ),
+                        validator: (value) {
+                          if (value == null || value.trim().length < 2) {
+                            return 'Enter a valid name.';
+                          }
+
+                          return null;
+                        },
+                      ),
+
+                      const SizedBox(height: 17),
+
+                      const Text(
+                        'I am registering as',
+                        style: TextStyle(fontWeight: FontWeight.w700),
+                      ),
+
+                      const SizedBox(height: 10),
+
+                      Row(
+                        children: [
+                          Expanded(
+                            child: _roleOption(
+                              'parent',
+                              'Parent / Adult',
+                              Icons.family_restroom_rounded,
+                            ),
+                          ),
+
+                          const SizedBox(width: 12),
+
+                          Expanded(
+                            child: _roleOption(
+                              'child',
+                              'Child',
+                              Icons.child_care_rounded,
+                            ),
+                          ),
+                        ],
+                      ),
+
+                      const SizedBox(height: 17),
+                    ],
+
+                    Text(
+                      isChildRegistration
+                          ? 'Choose a username'
+                          : _registering
+                              ? 'Email address'
+                              : 'Email or username',
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+
+                    const SizedBox(height: 8),
+
+                    TextFormField(
+                      controller: _email,
+                      keyboardType: isChildRegistration
+                          ? TextInputType.text
+                          : TextInputType.emailAddress,
+                      autocorrect: false,
+                      autofillHints: isChildRegistration
+                          ? const [AutofillHints.username]
+                          : const [AutofillHints.email],
+                      decoration: _decoration(
+                        isChildRegistration
+                            ? 'e.g. brian_kid'
+                            : _registering
+                                ? 'you@example.com'
+                                : 'Email address or username',
+                        isChildRegistration
+                            ? Icons.person_outline_rounded
+                            : Icons.email_outlined,
+                      ),
+                      validator: (value) {
+                        if (value == null || value.trim().isEmpty) {
+                          return isChildRegistration
+                              ? 'Choose a username.'
+                              : 'Enter your email or username.';
+                        }
+
+                        if (isChildRegistration) {
+                          final username = _normalizeUsername(value);
+
+                          if (!_isValidUsername(username)) {
+                            return 'Use 3+ letters, numbers, dots or underscores.';
+                          }
+
+                          return null;
+                        }
+
+                        if (_registering) {
+                          if (!RegExp(
+                            r'^[^@\s]+@[^@\s]+\.[^@\s]+$',
+                          ).hasMatch(value.trim())) {
+                            return 'Enter a valid email address.';
+                          }
+                        } else if (!value.contains('@')) {
+                          final username = _normalizeUsername(value);
+
+                          if (!_isValidUsername(username)) {
+                            return 'Enter a valid username.';
+                          }
+                        }
+
+                        return null;
+                      },
+                    ),
+
+                    const SizedBox(height: 17),
+
+                    const Text(
+                      'Password',
+                      style: TextStyle(fontWeight: FontWeight.w700),
+                    ),
+
+                    const SizedBox(height: 8),
+
+                    TextFormField(
+                      controller: _password,
+                      obscureText: _hidePassword,
+                      autofillHints: _registering
+                          ? const [AutofillHints.newPassword]
+                          : const [AutofillHints.password],
+                      decoration: _decoration(
+                        'Enter your password',
+                        Icons.lock_outline_rounded,
+                      ).copyWith(
+                        suffixIcon: IconButton(
+                          onPressed: () {
+                            setState(() {
+                              _hidePassword = !_hidePassword;
+                            });
+                          },
+                          icon: Icon(
+                            _hidePassword
+                                ? Icons.visibility_outlined
+                                : Icons.visibility_off_outlined,
+                          ),
+                        ),
+                      ),
+                      validator: (value) {
+                        if (value == null || value.length < 6) {
+                          return 'Password must be at least 6 characters.';
+                        }
+
+                        return null;
+                      },
+                    ),
+
+                    if (!_registering)
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: TextButton(
+                          onPressed: _loading ? null : _resetPassword,
+                          child: const Text('Forgot password?'),
+                        ),
+                      ),
+
+                    const SizedBox(height: 24),
+
+                    SizedBox(
+                      height: 54,
+                      child: FilledButton(
+                        onPressed: _loading ? null : _submit,
+                        style: FilledButton.styleFrom(
+                          backgroundColor: purple,
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                        ),
+                        child: _loading
+                            ? const SizedBox(
+                                height: 23,
+                                width: 23,
+                                child: CircularProgressIndicator(
+                                  color: Colors.white,
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : Text(
+                                _registering
+                                    ? 'Create account'
+                                    : 'Sign in',
+                                style: const TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                      ),
+                    ),
+
+                    const SizedBox(height: 18),
+
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Flexible(
+                          child: Text(
+                            _registering
+                                ? 'Already have an account?'
+                                : "Don't have an account?",
+                            style: const TextStyle(
+                              color: Color(0xFF77718A),
+                            ),
+                          ),
+                        ),
+
+                        TextButton(
+                          onPressed: _loading
+                              ? null
+                              : () {
+                                  setState(() {
+                                    _registering = !_registering;
+                                    _role = 'parent';
+                                    _formKey.currentState?.reset();
+                                  });
+                                },
+                          child: Text(
+                            _registering ? 'Sign in' : 'Register',
+                            style: const TextStyle(
+                              fontWeight: FontWeight.w800,
+                              color: purple,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+
+                    if (!_registering) ...[
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Children can sign in using the username and password '
+                        'provided by their parent.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Color(0xFF77718A),
+                          fontSize: 11,
+                          height: 1.5,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  InputDecoration _decoration(String hint, IconData icon) {
+    return InputDecoration(
+      hintText: hint,
+      prefixIcon: Icon(
+        icon,
+        color: const Color(0xFF8B7BB8),
+      ),
+      filled: true,
+      fillColor: Colors.white,
+      contentPadding: const EdgeInsets.symmetric(
+        horizontal: 16,
+        vertical: 17,
+      ),
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(15),
+        borderSide: const BorderSide(
+          color: Color(0xFFE7E0F5),
+        ),
+      ),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(15),
+        borderSide: const BorderSide(
+          color: Color(0xFFE7E0F5),
+        ),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(15),
+        borderSide: const BorderSide(
+          color: purple,
+          width: 1.5,
+        ),
+      ),
+    );
+  }
+
+  Widget _roleOption(
+    String value,
+    String title,
+    IconData icon,
+  ) {
+    final selected = _role == value;
+
+    return InkWell(
+      onTap: () {
+        setState(() {
+          _role = value;
+        });
+      },
+      borderRadius: BorderRadius.circular(15),
+      child: Container(
+        padding: const EdgeInsets.symmetric(
+          vertical: 15,
+          horizontal: 8,
+        ),
+        decoration: BoxDecoration(
+          color: selected
+              ? const Color(0xFFEDE6FF)
+              : Colors.white,
+          borderRadius: BorderRadius.circular(15),
+          border: Border.all(
+            color: selected
+                ? purple
+                : const Color(0xFFE7E0F5),
+            width: selected ? 1.7 : 1,
+          ),
+        ),
+        child: Column(
+          children: [
+            Icon(
+              icon,
+              color: selected
+                  ? purple
+                  : const Color(0xFF8B7BB8),
+            ),
+            const SizedBox(height: 7),
+            Text(
+              title,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontWeight: FontWeight.w700,
+                color: selected ? purple : ink,
+                fontSize: 12,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+
+===== lib\screens\profile_screen.dart =====
+
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../theme/app_theme.dart';
+import '../widgets/icon_tile.dart';
+import '../widgets/soft_card.dart';
+import '../widgets/screen_header.dart';
+
+class ProfileScreen extends StatelessWidget {
+  final bool kidsModeEnabled;
+  final ValueChanged<bool> onKidsModeChanged;
+  final Future<void> Function(String childProfileId) onChildSelected;
+
+  const ProfileScreen({
+    super.key,
+    required this.kidsModeEnabled,
+    required this.onKidsModeChanged,
+    required this.onChildSelected,
+  });
+
+  // ------------------------------------------------------------
+  // EDIT PARENT PROFILE
+  // ------------------------------------------------------------
+
+  Future<void> _editProfile(
+    BuildContext context,
+    String currentName,
+  ) async {
+    final user = FirebaseAuth.instance.currentUser;
+
+    if (user == null) return;
+
+    final controller = TextEditingController(text: currentName);
+    final formKey = GlobalKey<FormState>();
+
+    final newName = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) {
+        bool saving = false;
+
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Text('Personalize profile'),
+              content: Form(
+                key: formKey,
+                child: TextFormField(
+                  controller: controller,
+                  autofocus: true,
+                  maxLength: 40,
+                  textCapitalization: TextCapitalization.words,
+                  decoration: InputDecoration(
+                    labelText: 'Your name',
+                    hintText: 'Enter your name',
+                    prefixIcon: const Icon(Icons.person_outline_rounded),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                  validator: (value) {
+                    if (value == null || value.trim().isEmpty) {
+                      return 'Please enter your name.';
+                    }
+
+                    if (value.trim().length < 2) {
+                      return 'Name must contain at least 2 characters.';
+                    }
+
+                    return null;
+                  },
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: saving
+                      ? null
+                      : () => Navigator.pop(dialogContext),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: saving
+                      ? null
+                      : () async {
+                          if (!formKey.currentState!.validate()) return;
+
+                          setDialogState(() => saving = true);
+
+                          final name = controller.text.trim();
+
+                          try {
+                            await FirebaseFirestore.instance
+                                .collection('users')
+                                .doc(user.uid)
+                                .set({
+                              'name': name,
+                              'email': user.email,
+                              'updatedAt': FieldValue.serverTimestamp(),
+                            }, SetOptions(merge: true));
+
+                            await user.updateDisplayName(name);
+
+                            if (dialogContext.mounted) {
+                              Navigator.pop(dialogContext, name);
+                            }
+                          } catch (error) {
+                            setDialogState(() => saving = false);
+
+                            if (dialogContext.mounted) {
+                              ScaffoldMessenger.of(dialogContext).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    'Could not update profile: $error',
+                                  ),
+                                ),
+                              );
+                            }
+                          }
+                        },
+                  style: FilledButton.styleFrom(backgroundColor: purple),
+                  child: saving
+                      ? const SizedBox(
+                          height: 18,
+                          width: 18,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Colors.white,
+                          ),
+                        )
+                      : const Text('Save changes'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    controller.dispose();
+
+    if (newName != null && context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Your profile was updated successfully.'),
+        ),
+      );
+    }
+  }
+
+  // ------------------------------------------------------------
+  // CREATE CHILD FIREBASE ACCOUNT
+  // ------------------------------------------------------------
+
+  Future<void> _registerChild(BuildContext context) async {
+    final parent = FirebaseAuth.instance.currentUser;
+
+    if (parent == null) return;
+
+    final nameController = TextEditingController();
+    final usernameController = TextEditingController();
+    final passwordController = TextEditingController();
+
+    final formKey = GlobalKey<FormState>();
+
+    bool obscurePassword = true;
+    bool saving = false;
+
+    final credentials = await showDialog<Map<String, String>>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Text('Register a child'),
+              content: SingleChildScrollView(
+                child: Form(
+                  key: formKey,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text(
+                        'Create a personal Smart Rosary account for your child. '
+                        'They can later sign in using their username and password.',
+                        style: TextStyle(
+                          color: muted,
+                          fontSize: 12,
+                          height: 1.5,
+                        ),
+                      ),
+                      const SizedBox(height: 18),
+                      TextFormField(
+                        controller: nameController,
+                        textCapitalization: TextCapitalization.words,
+                        decoration: const InputDecoration(
+                          labelText: 'Child name',
+                          prefixIcon: Icon(Icons.child_care_rounded),
+                          border: OutlineInputBorder(),
+                        ),
+                        validator: (value) {
+                          if (value == null || value.trim().length < 2) {
+                            return 'Enter a valid child name.';
+                          }
+                          return null;
+                        },
+                      ),
+                      const SizedBox(height: 13),
+                      TextFormField(
+                        controller: usernameController,
+                        autocorrect: false,
+                        decoration: const InputDecoration(
+                          labelText: 'Username',
+                          hintText: 'e.g. brian_kid',
+                          prefixIcon: Icon(Icons.person_outline_rounded),
+                          border: OutlineInputBorder(),
+                        ),
+                        validator: (value) {
+                          final username =
+                              value?.trim().toLowerCase() ?? '';
+
+                          if (username.length < 3) {
+                            return 'Username must have at least 3 characters.';
+                          }
+
+                          if (!RegExp(r'^[a-z0-9._]+$')
+                              .hasMatch(username)) {
+                            return 'Use letters, numbers, dots or underscores.';
+                          }
+
+                          return null;
+                        },
+                      ),
+                      const SizedBox(height: 13),
+                      TextFormField(
+                        controller: passwordController,
+                        obscureText: obscurePassword,
+                        decoration: InputDecoration(
+                          labelText: 'Password',
+                          prefixIcon: const Icon(Icons.lock_outline_rounded),
+                          border: const OutlineInputBorder(),
+                          suffixIcon: IconButton(
+                            onPressed: () {
+                              setDialogState(() {
+                                obscurePassword = !obscurePassword;
+                              });
+                            },
+                            icon: Icon(
+                              obscurePassword
+                                  ? Icons.visibility_outlined
+                                  : Icons.visibility_off_outlined,
+                            ),
+                          ),
+                        ),
+                        validator: (value) {
+                          if (value == null || value.length < 6) {
+                            return 'Password must have at least 6 characters.';
+                          }
+                          return null;
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: saving
+                      ? null
+                      : () => Navigator.pop(dialogContext),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: saving
+                      ? null
+                      : () async {
+                          if (!formKey.currentState!.validate()) return;
+
+                          setDialogState(() => saving = true);
+
+                          final name = nameController.text.trim();
+                          final username =
+                              usernameController.text.trim().toLowerCase();
+                          final password = passwordController.text;
+
+                          final loginEmail = '$username@smartrosary.app';
+
+                          UserCredential? childCredential;
+                          FirebaseAuth? childAuth;
+
+                          try {
+                            // Create or reuse a secondary Firebase app.
+                            // This keeps the parent signed in on the
+                            // default Firebase app.
+                            FirebaseApp childApp;
+
+                            try {
+                              childApp =
+                                  Firebase.app('childRegistration');
+                            } catch (_) {
+                              childApp = await Firebase.initializeApp(
+                                name: 'childRegistration',
+                                options: Firebase.app().options,
+                              );
+                            }
+
+                            childAuth =
+                                FirebaseAuth.instanceFor(app: childApp);
+
+                            // Create the child's Firebase Auth account.
+                            childCredential =
+                                await childAuth.createUserWithEmailAndPassword(
+                              email: loginEmail,
+                              password: password,
+                            );
+
+                            final childUid = childCredential.user!.uid;
+
+                            final firestore = FirebaseFirestore.instance;
+                            final batch = firestore.batch();
+
+                            // Parent-managed child profile.
+                            final childProfileRef = firestore
+                                .collection('users')
+                                .doc(parent.uid)
+                                .collection('kids')
+                                .doc(childUid);
+
+                            // Child's own Firebase user document.
+                            final childUserRef = firestore
+                                .collection('users')
+                                .doc(childUid);
+
+                            batch.set(childProfileRef, {
+                              'childUid': childUid,
+                              'parentUid': parent.uid,
+                              'name': name,
+                              'username': username,
+                              'loginEmail': loginEmail,
+                              'accountType': 'parentManaged',
+                              'createdAt': FieldValue.serverTimestamp(),
+                              'updatedAt': FieldValue.serverTimestamp(),
+                            });
+
+                            // IMPORTANT:
+                            // uid and role are required by Firestore rules.
+                            batch.set(childUserRef, {
+                              'uid': childUid,
+                              'name': name,
+                              'username': username,
+                              'email': loginEmail,
+                              'role': 'child',
+                              'parentUid': parent.uid,
+                              'childProfileId': childUid,
+                              'accountType': 'parentManagedChild',
+                              'createdAt': FieldValue.serverTimestamp(),
+                              'updatedAt': FieldValue.serverTimestamp(),
+                            });
+
+                            // Default Firestore instance remains
+                            // authenticated as the parent.
+                            await batch.commit();
+
+                            // Sign out only the secondary child Auth.
+                            await childAuth.signOut();
+
+                            if (dialogContext.mounted) {
+                              Navigator.pop(dialogContext, {
+                                'name': name,
+                                'username': username,
+                                'password': password,
+                              });
+                            }
+                          } catch (error, stackTrace) {
+                            debugPrint(
+                              'CHILD REGISTRATION ERROR: $error',
+                            );
+                            debugPrintStack(stackTrace: stackTrace);
+
+                            // Best-effort cleanup of a newly created
+                            // authentication account.
+                            if (childCredential?.user != null) {
+                              try {
+                                await childCredential!.user!.delete();
+                              } catch (cleanupError) {
+                                debugPrint(
+                                  'CHILD ACCOUNT CLEANUP ERROR: '
+                                  '$cleanupError',
+                                );
+                              }
+                            }
+
+                            // Keep the parent registration dialog open.
+                            if (dialogContext.mounted) {
+                              setDialogState(() => saving = false);
+
+                              ScaffoldMessenger.of(dialogContext).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    'Could not register child: $error',
+                                  ),
+                                ),
+                              );
+                            }
+                          }
+                        },
+                  style: FilledButton.styleFrom(backgroundColor: purple),
+                  child: saving
+                      ? const SizedBox(
+                          height: 18,
+                          width: 18,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Colors.white,
+                          ),
+                        )
+                      : const Text('Create account'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    nameController.dispose();
+    usernameController.dispose();
+    passwordController.dispose();
+
+    if (credentials == null || !context.mounted) return;
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.check_circle_rounded, color: Colors.green),
+            SizedBox(width: 9),
+            Expanded(child: Text('Child account created')),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '${credentials['name']} can now sign in independently.',
+              style: const TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 18),
+            _CredentialRow(
+              label: 'Username',
+              value: credentials['username']!,
+            ),
+            const SizedBox(height: 10),
+            _CredentialRow(
+              label: 'Password',
+              value: credentials['password']!,
+            ),
+            const SizedBox(height: 14),
+            const Text(
+              'Save these login details securely. The password will not be '
+              'displayed again.',
+              style: TextStyle(
+                color: muted,
+                fontSize: 11,
+                height: 1.5,
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            style: FilledButton.styleFrom(backgroundColor: purple),
+            child: const Text('Done'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ------------------------------------------------------------
+  // SELECT CHILD FOR KIDS MODE
+  // ------------------------------------------------------------
+
+  Future<void> _chooseChild(BuildContext context) async {
+    final parent = FirebaseAuth.instance.currentUser;
+
+    if (parent == null) return;
+
+    final kidsRef = FirebaseFirestore.instance
+        .collection('users')
+        .doc(parent.uid)
+        .collection('kids');
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('Choose a child'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: kidsRef.orderBy('createdAt').snapshots(),
+              builder: (context, snapshot) {
+                if (snapshot.hasError) {
+                  return const Text(
+                    'Could not load children. Check your Firestore rules.',
+                    style: TextStyle(color: Colors.red),
+                  );
+                }
+
+                if (snapshot.connectionState == ConnectionState.waiting) {
+                  return const Padding(
+                    padding: EdgeInsets.all(20),
+                    child: Center(child: CircularProgressIndicator()),
+                  );
+                }
+
+                final children = snapshot.data?.docs ?? [];
+
+                if (children.isEmpty) {
+                  return const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 12),
+                    child: Text(
+                      'You have not registered any children yet. '
+                      'Add a child first to use Kids Mode.',
+                      style: TextStyle(
+                        color: muted,
+                        fontSize: 13,
+                        height: 1.5,
+                      ),
+                    ),
+                  );
+                }
+
+                return ListView.separated(
+                  shrinkWrap: true,
+                  itemCount: children.length,
+                  separatorBuilder: (_, __) => const Divider(height: 1),
+                  itemBuilder: (context, index) {
+                    final child = children[index];
+                    final data = child.data();
+
+                    final name = (data['name'] ?? 'Child').toString();
+                    final username =
+                        (data['username'] ?? '').toString();
+
+                    return ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const CircleAvatar(
+                        backgroundColor: Color(0xFFFFE7A8),
+                        child: Icon(
+                          Icons.child_care_rounded,
+                          color: Color(0xFFB77916),
+                        ),
+                      ),
+                      title: Text(
+                        name,
+                        style: const TextStyle(
+                          fontWeight: FontWeight.w800,
+                          color: ink,
+                        ),
+                      ),
+                      subtitle: username.isEmpty ? null : Text('@$username'),
+                      trailing: const Icon(
+                        Icons.arrow_forward_ios_rounded,
+                        size: 15,
+                      ),
+                      onTap: () async {
+                        Navigator.pop(dialogContext);
+                        await onChildSelected(child.id);
+                      },
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Cancel'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // ------------------------------------------------------------
+  // SIGN OUT
+  // ------------------------------------------------------------
+
+  Future<void> _signOut(BuildContext context) async {
+    final shouldSignOut = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Sign out?'),
+        content: const Text(
+          'Are you sure you want to sign out of Smart Rosary?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            style: FilledButton.styleFrom(backgroundColor: purple),
+            child: const Text('Sign Out'),
+          ),
+        ],
+      ),
+    );
+
+    if (shouldSignOut != true) return;
+
+    try {
+      await FirebaseAuth.instance.signOut();
+    } catch (error) {
+      if (!context.mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Sign out failed: $error')),
+      );
+    }
+  }
+
+  // ------------------------------------------------------------
+  // MAIN SCREEN
+  // ------------------------------------------------------------
+
+  @override
+  Widget build(BuildContext context) {
+    final user = FirebaseAuth.instance.currentUser;
+
+    return SafeArea(
+      bottom: false,
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(22, 25, 22, 125),
+        children: [
+          const ScreenHeader(
+            eyebrow: 'Your space',
+            title: 'My profile',
+            subtitle: 'Make your prayer journey your own.',
+          ),
+
+          const SizedBox(height: 24),
+
+          // Parent profile.
+          if (user == null)
+            const SoftCard(
+              child: Text(
+                'Please sign in to view your profile.',
+                style: TextStyle(color: muted),
+              ),
+            )
+          else
+            StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+              stream: FirebaseFirestore.instance
+                  .collection('users')
+                  .doc(user.uid)
+                  .snapshots(),
+              builder: (context, snapshot) {
+                final data = snapshot.data?.data();
+
+                final storedName = data?['name'] as String?;
+
+                final name = storedName?.trim().isNotEmpty == true
+                    ? storedName!.trim()
+                    : user.displayName ?? 'User';
+
+                final storedEmail = data?['email'] as String?;
+
+                final email = storedEmail?.trim().isNotEmpty == true
+                    ? storedEmail!.trim()
+                    : user.email ?? '';
+
+                return SoftCard(
+                  padding: const EdgeInsets.all(22),
+                  child: Column(
+                    children: [
+                      Container(
+                        width: 84,
+                        height: 84,
+                        decoration: const BoxDecoration(
+                          shape: BoxShape.circle,
+                          gradient: LinearGradient(
+                            colors: [
+                              Color(0xFFB9A4FF),
+                              purple,
+                            ],
+                          ),
+                        ),
+                        child: const Icon(
+                          Icons.person_rounded,
+                          size: 43,
+                          color: Colors.white,
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      Text(
+                        name,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: ink,
+                          fontSize: 20,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                      if (email.isNotEmpty) ...[
+                        const SizedBox(height: 5),
+                        Text(
+                          email,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            color: muted,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 5),
+                      const Text(
+                        'Your faith journey begins here',
+                        style: TextStyle(color: muted, fontSize: 12),
+                      ),
+                      const SizedBox(height: 16),
+                      OutlinedButton.icon(
+                        onPressed: () => _editProfile(context, name),
+                        icon: const Icon(
+                          Icons.edit_outlined,
+                          size: 17,
+                        ),
+                        label: const Text('Personalize profile'),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+
+          const SizedBox(height: 25),
+
+          // CHILDREN MANAGEMENT
+
+          Row(
+            children: [
+              const Expanded(
+                child: SectionTitle(title: 'My children'),
+              ),
+              FilledButton.icon(
+                onPressed: user == null
+                    ? null
+                    : () => _registerChild(context),
+                icon: const Icon(Icons.add_rounded, size: 18),
+                label: const Text('Add child'),
+                style: FilledButton.styleFrom(
+                  backgroundColor: purple,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 13,
+                    vertical: 10,
+                  ),
+                ),
+              ),
+            ],
+          ),
+
+          const SizedBox(height: 12),
+
+          if (user != null)
+            StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: FirebaseFirestore.instance
+                  .collection('users')
+                  .doc(user.uid)
+                  .collection('kids')
+                  .orderBy('createdAt')
+                  .snapshots(),
+              builder: (context, snapshot) {
+                if (snapshot.hasError) {
+                  return const SoftCard(
+                    child: Text(
+                      'Unable to load your children. Check your Firestore rules.',
+                      style: TextStyle(
+                        color: Colors.red,
+                        fontSize: 12,
+                      ),
+                    ),
+                  );
+                }
+
+                if (snapshot.connectionState == ConnectionState.waiting) {
+                  return const SoftCard(
+                    child: Center(
+                      child: CircularProgressIndicator(),
+                    ),
+                  );
+                }
+
+                final children = snapshot.data?.docs ?? [];
+
+                if (children.isEmpty) {
+                  return SoftCard(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      children: [
+                        const Icon(
+                          Icons.family_restroom_rounded,
+                          size: 42,
+                          color: Color(0xFF9A7AE8),
+                        ),
+                        const SizedBox(height: 10),
+                        const Text(
+                          'No children registered yet',
+                          style: TextStyle(
+                            color: ink,
+                            fontWeight: FontWeight.w900,
+                            fontSize: 14,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        const Text(
+                          'Add your child to create their own prayer account '
+                          'and track their learning progress.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: muted,
+                            fontSize: 11,
+                            height: 1.5,
+                          ),
+                        ),
+                        const SizedBox(height: 14),
+                        FilledButton.icon(
+                          onPressed: () => _registerChild(context),
+                          icon: const Icon(Icons.add_rounded),
+                          label: const Text('Register your first child'),
+                          style: FilledButton.styleFrom(
+                            backgroundColor: purple,
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                }
+
+                return Column(
+                  children: children.map((child) {
+                    final data = child.data();
+
+                    final name = (data['name'] ?? 'Child').toString();
+                    final username =
+                        (data['username'] ?? '').toString();
+
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 11),
+                      child: SoftCard(
+                        padding: const EdgeInsets.all(15),
+                        child: Row(
+                          children: [
+                            Container(
+                              width: 49,
+                              height: 49,
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFFFE7A8),
+                                borderRadius: BorderRadius.circular(15),
+                              ),
+                              child: const Icon(
+                                Icons.child_care_rounded,
+                                color: Color(0xFFB77916),
+                                size: 28,
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    name,
+                                    style: const TextStyle(
+                                      color: ink,
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.w900,
+                                    ),
+                                  ),
+                                  if (username.isNotEmpty) ...[
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      '@$username',
+                                      style: const TextStyle(
+                                        color: muted,
+                                        fontSize: 11,
+                                      ),
+                                    ),
+                                  ],
+                                  const SizedBox(height: 5),
+                                  const Text(
+                                    'Child account',
+                                    style: TextStyle(
+                                      color: Color(0xFF278443),
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            IconButton(
+                              tooltip: 'Open Kids Mode',
+                              onPressed: () async {
+                                await onChildSelected(child.id);
+                              },
+                              icon: const Icon(
+                                Icons.play_circle_fill_rounded,
+                                color: purple,
+                                size: 30,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  }).toList(),
+                );
+              },
+            ),
+
+          const SizedBox(height: 25),
+
+          const SectionTitle(title: 'Experience'),
+
+          const SizedBox(height: 12),
+
+          // KIDS MODE
+
+          SoftCard(
+            padding: const EdgeInsets.all(17),
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      width: 52,
+                      height: 52,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFFFE7A8),
+                        borderRadius: BorderRadius.circular(17),
+                      ),
+                      child: const Icon(
+                        Icons.child_care_rounded,
+                        size: 30,
+                        color: Color(0xFFB77916),
+                      ),
+                    ),
+                    const SizedBox(width: 13),
+                    const Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Kids Mode',
+                            style: TextStyle(
+                              color: ink,
+                              fontSize: 16,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                          SizedBox(height: 5),
+                          Text(
+                            'A fun, simple prayer adventure for children.',
+                            style: TextStyle(
+                              color: muted,
+                              fontSize: 11,
+                              height: 1.4,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Switch.adaptive(
+                      value: kidsModeEnabled,
+                      onChanged: (enabled) {
+                        if (enabled) {
+                          _chooseChild(context);
+                        } else {
+                          onKidsModeChanged(false);
+                        }
+                      },
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(13),
+                  decoration: BoxDecoration(
+                    color: kidsModeEnabled
+                        ? const Color(0xFFE8F8E9)
+                        : const Color(0xFFF2EDFF),
+                    borderRadius: BorderRadius.circular(15),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        kidsModeEnabled
+                            ? Icons.celebration_rounded
+                            : Icons.auto_awesome_rounded,
+                        color: kidsModeEnabled
+                            ? const Color(0xFF278443)
+                            : const Color(0xFF8056D8),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          kidsModeEnabled
+                              ? 'Kids Mode is on! Your child-friendly experience is active.'
+                              : 'Choose a child to open their personal prayer experience.',
+                          style: const TextStyle(
+                            color: ink,
+                            fontSize: 12,
+                            height: 1.4,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          const SizedBox(height: 25),
+
+          const SectionTitle(title: 'Settings'),
+
+          const SizedBox(height: 12),
+
+          _SettingsTile(
+            icon: Icons.child_care_rounded,
+            title: 'Learning level',
+            subtitle: 'Personalize learning for your child',
+            onTap: () => _showComingSoon(context, 'Learning levels'),
+          ),
+
+          _SettingsTile(
+            icon: Icons.volume_up_rounded,
+            title: 'Sound & audio',
+            subtitle: 'Prayer audio preferences',
+            onTap: () => _showComingSoon(context, 'Audio preferences'),
+          ),
+
+          _SettingsTile(
+            icon: Icons.family_restroom_rounded,
+            title: 'Parent area',
+            subtitle: 'Parent and guardian settings',
+            onTap: () => _showComingSoon(context, 'Parent management'),
+          ),
+
+          _SettingsTile(
+            icon: Icons.bluetooth_rounded,
+            title: 'Rosary device',
+            subtitle: 'Future Bluetooth connection settings',
+            onTap: () => _showComingSoon(
+              context,
+              'Arduino Bluetooth connection',
+            ),
+          ),
+
+          const SizedBox(height: 20),
+
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () => _signOut(context),
+              icon: const Icon(Icons.logout_rounded),
+              label: const Text('Sign Out'),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: Colors.red,
+                side: const BorderSide(color: Colors.red),
+                padding: const EdgeInsets.symmetric(vertical: 15),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 24),
+
+          const Center(
+            child: Text(
+              'SMART ROSARY  â€¢  LEARN, PRAY, GROW',
+              style: TextStyle(
+                color: muted,
+                fontSize: 10,
+                letterSpacing: 1.1,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showComingSoon(BuildContext context, String feature) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('$feature will be implemented in the next phase.'),
+      ),
+    );
+  }
+}
+
+// --------------------------------------------------------------
+// CREDENTIAL DISPLAY
+// --------------------------------------------------------------
+
+class _CredentialRow extends StatelessWidget {
+  final String label;
+  final String value;
+
+  const _CredentialRow({
+    required this.label,
+    required this.value,
+  });
+
+  Future<void> _copy(BuildContext context) async {
+    await Clipboard.setData(ClipboardData(text: value));
+
+    if (!context.mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('$label copied to clipboard.')),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label,
+                style: const TextStyle(
+                  color: muted,
+                  fontSize: 10,
+                ),
+              ),
+              const SizedBox(height: 4),
+              SelectableText(
+                value,
+                style: const TextStyle(
+                  color: ink,
+                  fontWeight: FontWeight.w800,
+                  fontSize: 13,
+                ),
+              ),
+            ],
+          ),
+        ),
+        IconButton(
+          onPressed: () => _copy(context),
+          icon: const Icon(Icons.copy_rounded, size: 18),
+        ),
+      ],
+    );
+  }
+}
+
+// --------------------------------------------------------------
+// SETTINGS TILE
+// --------------------------------------------------------------
+
+class _SettingsTile extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final VoidCallback onTap;
+
+  const _SettingsTile({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: SoftCard(
+        padding: const EdgeInsets.all(14),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(14),
+          child: Row(
+            children: [
+              IconTile(
+                icon: icon,
+                size: 46,
+              ),
+              const SizedBox(width: 13),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        color: ink,
+                        fontWeight: FontWeight.w800,
+                        fontSize: 13,
+                      ),
+                    ),
+                    const SizedBox(height: 5),
+                    Text(
+                      subtitle,
+                      style: const TextStyle(
+                        color: muted,
+                        fontSize: 10,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Icon(
+                Icons.chevron_right_rounded,
+                color: muted,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
+===== lib\screens\kids_mode_screen.dart =====
+
+import 'package:flutter/material.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+
+import '../services/kids_progress_service.dart';
+import 'kids_rosary_guide_screen.dart';
+
+/// Kids Mode for Smart Rosary.
+///
+/// Supports:
+/// 1. Parent-selected child profiles.
+/// 2. Parent-created children signing in independently.
+/// 3. Independent child accounts.
+///
+/// Parent-managed children share the same progress document whether
+/// the parent or child is using the account.
+class KidsModeScreen extends StatefulWidget {
+  final VoidCallback onExitKidsMode;
+  final String? parentUid;
+  final String? childProfileId;
+
+  const KidsModeScreen({
+    super.key,
+    required this.onExitKidsMode,
+    this.parentUid,
+    this.childProfileId,
+  });
+
+  @override
+  State<KidsModeScreen> createState() => _KidsModeScreenState();
+}
+
+// ---------------------------------------------------------------------------
+// Palette
+// ---------------------------------------------------------------------------
+
+class _Palette {
+  static const purple = Color(0xFF7654D6);
+  static const purpleDark = Color(0xFF5B3BB5);
+  static const purpleLight = Color(0xFF9476F2);
+  static const ink = Color(0xFF34265D);
+  static const muted = Color(0xFF81758F);
+  static const background = Color(0xFFFFFBF4);
+  static const lavender = Color(0xFFECE3FF);
+  static const lavenderSoft = Color(0xFFF5F0FF);
+  static const border = Color(0xFFEDE7F7);
+  static const sun = Color(0xFFFFF0C9);
+  static const sunDeep = Color(0xFFF2B531);
+  static const mint = Color(0xFFE2F5E3);
+  static const rose = Color(0xFFFFE6EC);
+  static const sky = Color(0xFFE0F0FF);
+  static const peach = Color(0xFFFFEBDC);
+}
+
+// ---------------------------------------------------------------------------
+// Shell
+// ---------------------------------------------------------------------------
+
+class _KidsModeScreenState extends State<KidsModeScreen> {
+  int selectedTab = 0;
+
+  KidsProgressService? progressService;
+  bool loadingProgress = true;
+  String? progressError;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeProgressService();
+  }
+
+  Future<void> _initializeProgressService() async {
+    try {
+      // CASE 1: Parent has selected a particular child.
+      if (widget.parentUid != null &&
+          widget.childProfileId != null) {
+        progressService = KidsProgressService.parentManaged(
+          parentUid: widget.parentUid!,
+          childProfileId: widget.childProfileId!,
+        );
+      } else {
+        // CASE 2: A child has signed in independently.
+        final user = FirebaseAuth.instance.currentUser;
+
+        if (user == null) {
+          throw StateError(
+            'No authenticated user for Kids Mode.',
+          );
+        }
+
+        // Check whether this account was created by a parent.
+        final userSnapshot = await FirebaseFirestore.instance
+            .collection('users')
+            .doc(user.uid)
+            .get();
+
+        final userData =
+            userSnapshot.data() ?? <String, dynamic>{};
+
+        final parentUid =
+            userData['parentUid']?.toString();
+
+        final childProfileId =
+            userData['childProfileId']?.toString();
+
+        if (parentUid != null &&
+            parentUid.isNotEmpty &&
+            childProfileId != null &&
+            childProfileId.isNotEmpty) {
+          // Parent-created child:
+          // use the parent's child progress document.
+          progressService = KidsProgressService.parentManaged(
+            parentUid: parentUid,
+            childProfileId: childProfileId,
+          );
+        } else {
+          // Independent child:
+          // use the child's own progress document.
+          progressService =
+              KidsProgressService.independent(user.uid);
+        }
+      }
+    } catch (error) {
+      progressError = error.toString();
+    }
+
+    if (!mounted) return;
+
+    setState(() {
+      loadingProgress = false;
+    });
+  }
+
+  static const destinations = [
+    (Icons.home_rounded, 'Home'),
+    (Icons.menu_book_rounded, 'Learn'),
+    (Icons.favorite_rounded, 'Pray'),
+    (Icons.emoji_events_rounded, 'Rewards'),
+  ];
+
+  List<Widget> get pages {
+    final service = progressService!;
+
+    return [
+      _KidsHomePage(progressService: service),
+      _KidsLearnPage(progressService: service),
+      _KidsPrayPage(progressService: service),
+      _KidsRewardsPage(progressService: service),
+    ];
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: _Palette.background,
+      body: Stack(
+        children: [
+          const Positioned(
+            top: -70,
+            right: -60,
+            child: IgnorePointer(
+              child: _Blob(
+                size: 220,
+                color: Color(0xFFF1E9FF),
+              ),
+            ),
+          ),
+          const Positioned(
+            top: 260,
+            left: -90,
+            child: IgnorePointer(
+              child: _Blob(
+                size: 190,
+                color: Color(0xFFFFF3D6),
+              ),
+            ),
+          ),
+          SafeArea(
+            bottom: false,
+            child: Column(
+              children: [
+                _buildHeader(),
+                Expanded(
+                  child: _buildPageContent(),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+      bottomNavigationBar: _buildNavBar(),
+    );
+  }
+
+  Widget _buildPageContent() {
+    if (loadingProgress) {
+      return const Center(
+        child: CircularProgressIndicator(
+          color: _Palette.purple,
+        ),
+      );
+    }
+
+    if (progressError != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.cloud_off_rounded,
+                color: _Palette.purple,
+                size: 42,
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'Could not load your progress.',
+                style: TextStyle(
+                  color: _Palette.ink,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                progressError!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: _Palette.muted,
+                ),
+              ),
+              const SizedBox(height: 12),
+              FilledButton(
+                onPressed: () {
+                  setState(() {
+                    loadingProgress = true;
+                    progressError = null;
+                  });
+                  _initializeProgressService();
+                },
+                child: const Text('Try again'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 240),
+      switchInCurve: Curves.easeOutCubic,
+      transitionBuilder: (child, animation) {
+        return FadeTransition(
+          opacity: animation,
+          child: SlideTransition(
+            position: Tween<Offset>(
+              begin: const Offset(0, 0.02),
+              end: Offset.zero,
+            ).animate(animation),
+            child: child,
+          ),
+        );
+      },
+      child: KeyedSubtree(
+        key: ValueKey(selectedTab),
+        child: pages[selectedTab],
+      ),
+    );
+  }
+
+  Widget _buildHeader() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 12, 12, 8),
+      child: Row(
+        children: [
+          Container(
+            height: 48,
+            width: 48,
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(
+                colors: [
+                  _Palette.purpleLight,
+                  _Palette.purple,
+                ],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.circular(17),
+              boxShadow: const [
+                BoxShadow(
+                  color: Color(0x337654D6),
+                  blurRadius: 10,
+                  offset: Offset(0, 4),
+                ),
+              ],
+            ),
+            child: const Icon(
+              Icons.auto_awesome_rounded,
+              color: Colors.white,
+              size: 27,
+            ),
+          ),
+          const SizedBox(width: 12),
+          const Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Little Prayer Star',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: _Palette.ink,
+                    fontWeight: FontWeight.w900,
+                    fontSize: 18,
+                  ),
+                ),
+                Text(
+                  'LEARN â€¢ PRAY â€¢ GROW',
+                  style: TextStyle(
+                    color: _Palette.purple,
+                    fontWeight: FontWeight.w800,
+                    fontSize: 10,
+                    letterSpacing: 1.2,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Tooltip(
+            message: 'Parent area',
+            child: Semantics(
+              button: true,
+              label: 'Parent area',
+              child: InkWell(
+                borderRadius: BorderRadius.circular(16),
+                onTap: _showParentDialog,
+                child: Container(
+                  height: 48,
+                  width: 48,
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(
+                      color: _Palette.border,
+                    ),
+                  ),
+                  child: const Icon(
+                    Icons.family_restroom_rounded,
+                    color: _Palette.ink,
+                    size: 26,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildNavBar() {
+    return Container(
+      decoration: const BoxDecoration(
+        color: Colors.white,
+        border: Border(
+          top: BorderSide(color: _Palette.border),
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Color(0x0F34265D),
+            blurRadius: 16,
+            offset: Offset(0, -4),
+          ),
+        ],
+      ),
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+          child: Row(
+            children: List.generate(destinations.length, (index) {
+              final selected = selectedTab == index;
+              final destination = destinations[index];
+
+              return Expanded(
+                child: Semantics(
+                  button: true,
+                  selected: selected,
+                  label: destination.$2,
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(20),
+                    onTap: () {
+                      setState(() => selectedTab = index);
+                    },
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 200),
+                      curve: Curves.easeOut,
+                      constraints: const BoxConstraints(
+                        minHeight: 60,
+                      ),
+                      margin: const EdgeInsets.symmetric(
+                        horizontal: 3,
+                      ),
+                      padding: const EdgeInsets.symmetric(
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: selected
+                            ? _Palette.lavender
+                            : Colors.transparent,
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          AnimatedScale(
+                            scale: selected ? 1.12 : 1,
+                            duration: const Duration(
+                              milliseconds: 200,
+                            ),
+                            child: Icon(
+                              destination.$1,
+                              size: 28,
+                              color: selected
+                                  ? _Palette.purple
+                                  : const Color(0xFF9B91AD),
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            destination.$2,
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w800,
+                              color: selected
+                                  ? _Palette.purple
+                                  : const Color(0xFF6E6382),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showParentDialog() async {
+    final shouldExit = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(28),
+        ),
+        icon: Container(
+          height: 64,
+          width: 64,
+          decoration: const BoxDecoration(
+            color: _Palette.lavender,
+            shape: BoxShape.circle,
+          ),
+          child: const Icon(
+            Icons.family_restroom_rounded,
+            color: _Palette.purple,
+            size: 36,
+          ),
+        ),
+        title: const Text(
+          'Parent area',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: _Palette.ink,
+            fontWeight: FontWeight.w900,
+          ),
+        ),
+        content: const Text(
+          'Would you like to leave Kids Mode and return to the regular app?',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: _Palette.muted,
+            height: 1.4,
+          ),
+        ),
+        actionsAlignment: MainAxisAlignment.center,
+        actionsOverflowButtonSpacing: 8,
+        actions: [
+          TextButton(
+            style: TextButton.styleFrom(
+              minimumSize: const Size(110, 48),
+              foregroundColor: _Palette.purple,
+            ),
+            onPressed: () {
+              Navigator.pop(dialogContext, false);
+            },
+            child: const Text(
+              'Stay here',
+              style: TextStyle(fontWeight: FontWeight.w800),
+            ),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: _Palette.purple,
+              minimumSize: const Size(130, 48),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+              ),
+            ),
+            onPressed: () {
+              Navigator.pop(dialogContext, true);
+            },
+            child: const Text(
+              'Exit Kids Mode',
+              style: TextStyle(fontWeight: FontWeight.w800),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    if (shouldExit == true && mounted) {
+      widget.onExitKidsMode();
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Bible-story artwork
+// ---------------------------------------------------------------------------
+
+class _KidsIllustration extends StatelessWidget {
+  final String asset;
+  final double height;
+  final BoxFit fit;
+
+  const _KidsIllustration({
+    required this.asset,
+    this.height = 120,
+  }) : fit = BoxFit.contain;
+
+  @override
+  Widget build(BuildContext context) {
+    return Image.asset(
+      'assets/kids/$asset',
+      height: height,
+      fit: fit,
+      errorBuilder: (context, error, stackTrace) {
+        return const Icon(
+          Icons.auto_awesome_rounded,
+          color: _Palette.purple,
+          size: 42,
+        );
+      },
+    );
+  }
+}
+
+class _BibleStoryCard extends StatelessWidget {
+  final String title;
+  final String description;
+  final String imageUrl;
+  final String storyText;
+  final String activity;
+  final Color tint;
+
+  const _BibleStoryCard({
+    required this.title,
+    required this.description,
+    required this.imageUrl,
+    required this.storyText,
+    required this.activity,
+    required this.tint,
+  });
+
+  void _openStory(BuildContext context) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (sheetContext) => DraggableScrollableSheet(
+        initialChildSize: 0.72,
+        minChildSize: 0.45,
+        maxChildSize: 0.92,
+        expand: false,
+        builder: (context, controller) {
+          return Container(
+            decoration: const BoxDecoration(
+              color: _Palette.background,
+              borderRadius: BorderRadius.vertical(
+                top: Radius.circular(28),
+              ),
+            ),
+            child: ListView(
+              controller: controller,
+              padding: const EdgeInsets.fromLTRB(22, 14, 22, 30),
+              children: [
+                Center(
+                  child: Container(
+                    width: 42,
+                    height: 5,
+                    decoration: BoxDecoration(
+                      color: _Palette.border,
+                      borderRadius: BorderRadius.circular(5),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 18),
+                if (imageUrl.isNotEmpty)
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(22),
+                    child: Image.network(
+                      imageUrl,
+                      height: 190,
+                      width: double.infinity,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, _, _) {
+                        return Container(
+                          height: 150,
+                          color: tint,
+                          alignment: Alignment.center,
+                          child: const Icon(
+                            Icons.auto_stories_rounded,
+                            color: _Palette.purple,
+                            size: 54,
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                const SizedBox(height: 18),
+                Text(
+                  title,
+                  style: const TextStyle(
+                    color: _Palette.ink,
+                    fontSize: 24,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  description,
+                  style: const TextStyle(
+                    color: _Palette.muted,
+                    fontSize: 14,
+                    height: 1.5,
+                  ),
+                ),
+                if (storyText.trim().isNotEmpty) ...[
+                  const SizedBox(height: 18),
+                  const Text(
+                    'THE STORY',
+                    style: TextStyle(
+                      color: _Palette.purple,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 1,
+                      fontSize: 11,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    storyText,
+                    style: const TextStyle(
+                      color: _Palette.ink,
+                      fontSize: 15,
+                      height: 1.7,
+                    ),
+                  ),
+                ],
+                if (activity.trim().isNotEmpty) ...[
+                  const SizedBox(height: 20),
+                  Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: _Palette.sun,
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'LETâ€™S TRY THIS',
+                          style: TextStyle(
+                            color: _Palette.ink,
+                            fontWeight: FontWeight.w900,
+                            fontSize: 11,
+                            letterSpacing: 1,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          activity,
+                          style: const TextStyle(
+                            color: _Palette.ink,
+                            height: 1.5,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _Pressable(
+      semanticLabel: '$title. $description. Open story.',
+      onTap: () => _openStory(context),
+      child: Container(
+        width: 190,
+        height: 235,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(24),
+          border: Border.all(color: _Palette.border),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x0D34265D),
+              blurRadius: 12,
+              offset: Offset(0, 5),
+            ),
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              height: 112,
+              width: double.infinity,
+              decoration: BoxDecoration(
+                color: tint,
+                borderRadius: BorderRadius.circular(18),
+              ),
+              clipBehavior: Clip.antiAlias,
+              child: imageUrl.isEmpty
+                  ? const Icon(
+                      Icons.auto_stories_rounded,
+                      color: _Palette.purple,
+                      size: 48,
+                    )
+                  : Image.network(
+                      imageUrl,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, _, _) {
+                        return const Icon(
+                          Icons.auto_stories_rounded,
+                          color: _Palette.purple,
+                          size: 48,
+                        );
+                      },
+                    ),
+            ),
+            const SizedBox(height: 9),
+            Text(
+              title,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: _Palette.ink,
+                fontWeight: FontWeight.w900,
+                fontSize: 15,
+              ),
+            ),
+            const SizedBox(height: 3),
+            Expanded(
+              child: Text(
+                description,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: _Palette.muted,
+                  fontSize: 12,
+                  height: 1.3,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Home page
+// ---------------------------------------------------------------------------
+
+class _KidsHomePage extends StatelessWidget {
+  final KidsProgressService progressService;
+
+  const _KidsHomePage({
+    required this.progressService,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<KidsProgress>(
+      stream: progressService.watch(),
+      builder: (context, snapshot) {
+        final progress = snapshot.data ?? const KidsProgress();
+
+        return ListView(
+          padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
+          children: [
+            const Text(
+              'Hello, Prayer Star! â­',
+              style: TextStyle(
+                color: _Palette.ink,
+                fontSize: 26,
+                fontWeight: FontWeight.w900,
+              ),
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              'Ready for a little moment with God?',
+              style: TextStyle(
+                color: _Palette.muted,
+                fontSize: 15,
+              ),
+            ),
+            const SizedBox(height: 18),
+            Container(
+              padding: const EdgeInsets.all(22),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(32),
+                gradient: const LinearGradient(
+                  colors: [
+                    _Palette.purpleLight,
+                    _Palette.purpleDark,
+                  ],
+                ),
+                boxShadow: const [
+                  BoxShadow(
+                    color: Color(0x40654AC4),
+                    blurRadius: 22,
+                    offset: Offset(0, 10),
+                  ),
+                ],
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'YOUR NEXT ADVENTURE',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 1,
+                      fontSize: 11,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    'Guided Rosary Journey',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 23,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  const Text(
+                    'Learn the Rosary one little prayer at a time. Listen, follow the words, and earn stars as you go.',
+                    style: TextStyle(
+                      color: Color(0xFFF0E9FF),
+                      height: 1.4,
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  FilledButton.icon(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: Colors.white,
+                      foregroundColor: _Palette.purple,
+                    ),
+                    onPressed: () {
+                      Navigator.of(context).push(
+                        MaterialPageRoute<void>(
+                          builder: (_) => KidsRosaryGuideScreen(
+                            progressService: progressService,
+                          ),
+                        ),
+                      );
+                    },
+                    icon: const Icon(Icons.play_arrow_rounded),
+                    label: const Text('Start Rosary journey'),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 22),
+            Row(
+              children: [
+                Expanded(
+                  child: _MiniStat(
+                    emoji: 'â­',
+                    title: 'My stars',
+                    value: '${progress.stars}',
+                    color: _Palette.sun,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _MiniStat(
+                    emoji: 'ðŸ™',
+                    title: 'Prayer days',
+                    value: '${progress.prayerDays.length}',
+                    color: _Palette.mint,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 22),
+            const _SectionTitle('Bible story adventures'),
+            const SizedBox(height: 12),
+            const SizedBox(
+              height: 250,
+              child: _StoryPreviewStrip(),
+            ),
+            const SizedBox(height: 22),
+            const _SectionTitle('Your progress'),
+            const SizedBox(height: 10),
+            _ProgressRow(
+              label: 'Lessons completed',
+              value: progress.completedLessons.length,
+              total: 4,
+              color: _Palette.purple,
+              trackColor: _Palette.lavender,
+            ),
+            const SizedBox(height: 12),
+            _ProgressRow(
+              label: 'Prayers completed',
+              value: progress.completedPrayers.length,
+              total: 7,
+              color: const Color(0xFF3F8FE0),
+              trackColor: _Palette.sky,
+            ),
+            const SizedBox(height: 18),
+            const _PreviewNote(
+              'Your stars and progress are saved to your account.',
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Bible story strip
+// ---------------------------------------------------------------------------
+
+class _StoryPreviewStrip extends StatelessWidget {
+  const _StoryPreviewStrip();
+
+  static const _tints = [
+    _Palette.sky,
+    _Palette.mint,
+    _Palette.sun,
+    _Palette.rose,
+    _Palette.lavender,
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    final storiesQuery = FirebaseFirestore.instance
+        .collection('kidsStories')
+        .where('published', isEqualTo: true);
+
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: storiesQuery.snapshots(),
+      builder: (context, snapshot) {
+        if (snapshot.hasError) {
+          return Container(
+            alignment: Alignment.center,
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(22),
+              border: Border.all(color: _Palette.border),
+            ),
+            child: const Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.cloud_off_rounded,
+                  color: _Palette.purple,
+                  size: 34,
+                ),
+                SizedBox(height: 8),
+                Text(
+                  'We could not load the stories.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: _Palette.ink,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ],
+            ),
+          );
+        }
+
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(
+            child: CircularProgressIndicator(
+              color: _Palette.purple,
+            ),
+          );
+        }
+
+        final docs = [...(snapshot.data?.docs ?? [])];
+
+        docs.sort((a, b) {
+          final aOrder = a.data()['order'];
+          final bOrder = b.data()['order'];
+
+          final aValue = aOrder is num ? aOrder : 0;
+          final bValue = bOrder is num ? bOrder : 0;
+
+          return aValue.compareTo(bValue);
+        });
+
+        if (docs.isEmpty) {
+          return Container(
+            alignment: Alignment.center,
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(22),
+              border: Border.all(color: _Palette.border),
+            ),
+            child: const Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.auto_stories_rounded,
+                  color: _Palette.purple,
+                  size: 36,
+                ),
+                SizedBox(height: 8),
+                Text(
+                  'No published stories yet. Publish a story in the admin dashboard to see it here.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: _Palette.muted,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ),
+          );
+        }
+
+        return ListView.separated(
+          scrollDirection: Axis.horizontal,
+          itemCount: docs.length,
+          separatorBuilder: (_, _) => const SizedBox(width: 12),
+          itemBuilder: (context, index) {
+            final data = docs[index].data();
+
+            return _BibleStoryCard(
+              title: (data['title'] ?? 'Untitled story').toString(),
+              description: (data['description'] ?? '').toString(),
+              imageUrl: (data['imageUrl'] ?? '').toString(),
+              storyText: (data['storyText'] ?? '').toString(),
+              activity: (data['activity'] ?? '').toString(),
+              tint: _tints[index % _tints.length],
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Learn page
+// ---------------------------------------------------------------------------
+
+class _KidsLearnPage extends StatelessWidget {
+  final KidsProgressService progressService;
+
+  const _KidsLearnPage({
+    required this.progressService,
+  });
+
+  static const lessons = [
+    (
+      'sign_of_cross',
+      'âœï¸',
+      'Sign of the Cross',
+      'Learn how to begin your prayer.',
+      _Palette.lavender,
+      'feeding_the_five_thousand.png',
+    ),
+    (
+      'our_father',
+      'ðŸ¤',
+      'Our Father',
+      'Discover the prayer Jesus taught us.',
+      _Palette.sky,
+      'baby_moses.png',
+    ),
+    (
+      'jesus_children',
+      'ðŸŒ¹',
+      'Jesus and the Children',
+      'Discover how Jesus welcomed children.',
+      _Palette.rose,
+      'jesus_and_the_children.png',
+    ),
+    (
+      'garden_eden',
+      'ðŸ“¿',
+      'The Garden of Eden',
+      'Explore Godâ€™s beautiful creation.',
+      _Palette.sun,
+      'the_garden_of_eden.png',
+    ),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<KidsProgress>(
+      stream: progressService.watch(),
+      builder: (context, snapshot) {
+        final progress = snapshot.data ?? const KidsProgress();
+
+        return ListView(
+          padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
+          children: [
+            const _PageHeading(
+              emoji: 'ðŸ“š',
+              title: 'Letâ€™s learn!',
+              subtitle: 'Discover prayers one little step at a time.',
+            ),
+            const SizedBox(height: 18),
+            _ProgressRow(
+              label: 'Lessons completed',
+              value: progress.completedLessons.length,
+              total: lessons.length,
+              color: _Palette.purple,
+              trackColor: _Palette.lavender,
+            ),
+            const SizedBox(height: 16),
+            for (var i = 0; i < lessons.length; i++)
+              _ProgressLessonCard(
+                number: i + 1,
+                data: lessons[i],
+                completed: progress.completedLessons
+                    .contains(lessons[i].$1),
+                onTap: () => _openKidsActivity(
+                  context,
+                  service: progressService,
+                  id: lessons[i].$1,
+                  title: lessons[i].$3,
+                  emoji: lessons[i].$2,
+                  isLesson: true,
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _ProgressLessonCard extends StatelessWidget {
+  final int number;
+  final (String, String, String, String, Color, String) data;
+  final bool completed;
+  final VoidCallback onTap;
+
+  const _ProgressLessonCard({
+    required this.number,
+    required this.data,
+    required this.completed,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: _Pressable(
+        semanticLabel: 'Open ${data.$3}',
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.all(15),
+          decoration: BoxDecoration(
+            color: data.$5,
+            borderRadius: BorderRadius.circular(26),
+          ),
+          child: Row(
+            children: [
+              Container(
+                width: 68,
+                height: 68,
+                decoration: const BoxDecoration(
+                  color: Colors.white,
+                  shape: BoxShape.circle,
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(7),
+                  child: _KidsIllustration(
+                    asset: data.$6,
+                    height: 58,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'LESSON $number',
+                      style: const TextStyle(
+                        color: _Palette.purple,
+                        fontSize: 10,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      data.$3,
+                      style: const TextStyle(
+                        color: _Palette.ink,
+                        fontWeight: FontWeight.w900,
+                        fontSize: 16,
+                      ),
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      data.$4,
+                      style: const TextStyle(
+                        color: _Palette.ink,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Icon(
+                completed
+                    ? Icons.check_circle_rounded
+                    : Icons.play_circle_fill_rounded,
+                color: completed
+                    ? Colors.green
+                    : _Palette.purple,
+                size: 28,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pray page
+// ---------------------------------------------------------------------------
+
+class _KidsPrayPage extends StatelessWidget {
+  final KidsProgressService progressService;
+
+  const _KidsPrayPage({
+    required this.progressService,
+  });
+
+  static const prayers = [
+    (
+      'sign_of_cross',
+      'âœï¸',
+      'Sign of the Cross',
+      'Begin with love',
+      _Palette.lavender,
+    ),
+    (
+      'our_father',
+      'ðŸ¤',
+      'Our Father',
+      'The prayer Jesus taught us',
+      _Palette.sky,
+    ),
+    (
+      'hail_mary',
+      'ðŸŒ¹',
+      'Hail Mary',
+      'A prayer to Mary',
+      _Palette.rose,
+    ),
+    (
+      'joyful_mysteries',
+      'â˜€ï¸',
+      'Joyful Mysteries',
+      'Monday and Saturday',
+      _Palette.sun,
+    ),
+    (
+      'sorrowful_mysteries',
+      'ðŸ’§',
+      'Sorrowful Mysteries',
+      'Tuesday and Friday',
+      _Palette.sky,
+    ),
+    (
+      'glorious_mysteries',
+      'âœ¨',
+      'Glorious Mysteries',
+      'Wednesday and Sunday',
+      _Palette.lavender,
+    ),
+    (
+      'luminous_mysteries',
+      'ðŸ’›',
+      'Luminous Mysteries',
+      'Thursday',
+      _Palette.peach,
+    ),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<KidsProgress>(
+      stream: progressService.watch(),
+      builder: (context, snapshot) {
+        final progress = snapshot.data ?? const KidsProgress();
+
+        return ListView(
+          padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
+          children: [
+            const _PageHeading(
+              emoji: 'ðŸ™',
+              title: 'Letâ€™s pray',
+              subtitle: 'Find a quiet moment and pray with your heart.',
+            ),
+            const SizedBox(height: 18),
+            _ProgressRow(
+              label: 'Prayers completed',
+              value: progress.completedPrayers.length,
+              total: prayers.length,
+              color: const Color(0xFF3F8FE0),
+              trackColor: _Palette.sky,
+            ),
+            const SizedBox(height: 18),
+            const _SectionTitle('Little prayers and Rosary'),
+            const SizedBox(height: 12),
+            for (final prayer in prayers)
+              _ProgressPrayerCard(
+                data: prayer,
+                completed: progress.completedPrayers
+                    .contains(prayer.$1),
+                onTap: () => _openKidsActivity(
+                  context,
+                  service: progressService,
+                  id: prayer.$1,
+                  title: prayer.$3,
+                  emoji: prayer.$2,
+                  isLesson: false,
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _ProgressPrayerCard extends StatelessWidget {
+  final (String, String, String, String, Color) data;
+  final bool completed;
+  final VoidCallback onTap;
+
+  const _ProgressPrayerCard({
+    required this.data,
+    required this.completed,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 11),
+      child: _Pressable(
+        semanticLabel: 'Open ${data.$3}',
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(22),
+            border: Border.all(color: _Palette.border),
+          ),
+          child: Row(
+            children: [
+              Container(
+                width: 54,
+                height: 54,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: data.$5,
+                  borderRadius: BorderRadius.circular(17),
+                ),
+                child: Text(
+                  data.$2,
+                  style: const TextStyle(fontSize: 28),
+                ),
+              ),
+              const SizedBox(width: 13),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      data.$3,
+                      style: const TextStyle(
+                        color: _Palette.ink,
+                        fontWeight: FontWeight.w900,
+                        fontSize: 15,
+                      ),
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      data.$4,
+                      style: const TextStyle(
+                        color: _Palette.muted,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Icon(
+                completed
+                    ? Icons.check_circle_rounded
+                    : Icons.arrow_forward_ios_rounded,
+                color: completed
+                    ? Colors.green
+                    : _Palette.purple,
+                size: 20,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rewards page
+// ---------------------------------------------------------------------------
+
+class _KidsRewardsPage extends StatelessWidget {
+  final KidsProgressService progressService;
+
+  const _KidsRewardsPage({
+    required this.progressService,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<KidsProgress>(
+      stream: progressService.watch(),
+      builder: (context, snapshot) {
+        final progress = snapshot.data ?? const KidsProgress();
+
+        final badgeTitles = [
+          'First Prayer Star',
+          'Maryâ€™s Little Helper',
+          'Rosary Explorer',
+          'Peaceful Heart',
+        ];
+
+        final badgeDescriptions = [
+          'Complete your first prayer.',
+          'Learn the Hail Mary.',
+          'Complete all four mysteries.',
+          'Complete lessons and prayers.',
+        ];
+
+        const badgeEmojis = ['â­', 'ðŸŒ¹', 'ðŸ“¿', 'ðŸ•Šï¸'];
+
+        return ListView(
+          padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
+          children: [
+            const _PageHeading(
+              emoji: 'ðŸ†',
+              title: 'My little rewards',
+              subtitle: 'Celebrate the time you spend learning and praying.',
+            ),
+            const SizedBox(height: 20),
+            Container(
+              padding: const EdgeInsets.all(22),
+              decoration: BoxDecoration(
+                color: _Palette.sun,
+                borderRadius: BorderRadius.circular(28),
+              ),
+              child: Column(
+                children: [
+                  Text(
+                    'â­ ${progress.stars} stars',
+                    style: const TextStyle(
+                      color: _Palette.ink,
+                      fontSize: 28,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  _ProgressRow(
+                    label: 'Badges collected',
+                    value: progress.badges,
+                    total: 4,
+                    color: _Palette.sunDeep,
+                    trackColor: Colors.white,
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 24),
+            const _SectionTitle('Badges'),
+            const SizedBox(height: 12),
+            _TwoColumn(
+              children: List.generate(4, (i) {
+                final earned = [
+                  progress.firstPrayerBadge,
+                  progress.maryBadge,
+                  progress.rosaryBadge,
+                  progress.peacefulHeartBadge,
+                ][i];
+
+                return _EarnedBadgeCard(
+                  emoji: badgeEmojis[i],
+                  title: badgeTitles[i],
+                  subtitle: badgeDescriptions[i],
+                  earned: earned,
+                );
+              }),
+            ),
+            const SizedBox(height: 18),
+            const _SectionTitle('Journeys'),
+            const SizedBox(height: 12),
+            _ProgressRow(
+              label: 'Learn the prayers',
+              value: progress.completedLessons.length,
+              total: 4,
+              color: _Palette.purple,
+              trackColor: _Palette.lavender,
+            ),
+            const SizedBox(height: 14),
+            _ProgressRow(
+              label: 'Complete prayers',
+              value: progress.completedPrayers.length,
+              total: 7,
+              color: const Color(0xFF3F8FE0),
+              trackColor: _Palette.sky,
+            ),
+            const SizedBox(height: 14),
+            _ProgressRow(
+              label: 'Prayer days',
+              value: progress.prayerDays.length,
+              total: 7,
+              color: Colors.green,
+              trackColor: _Palette.mint,
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _EarnedBadgeCard extends StatelessWidget {
+  final String emoji;
+  final String title;
+  final String subtitle;
+  final bool earned;
+
+  const _EarnedBadgeCard({
+    required this.emoji,
+    required this.title,
+    required this.subtitle,
+    required this.earned,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(
+          color: earned ? _Palette.sunDeep : _Palette.border,
+          width: earned ? 2 : 1,
+        ),
+      ),
+      child: Column(
+        children: [
+          Text(
+            emoji,
+            style: TextStyle(
+              fontSize: 35,
+              color: earned ? null : Colors.grey,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            title,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              color: _Palette.ink,
+              fontWeight: FontWeight.w900,
+              fontSize: 13,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            subtitle,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              color: _Palette.muted,
+              fontSize: 11,
+            ),
+          ),
+          const SizedBox(height: 8),
+          _SoonPill(
+            label: earned ? 'Earned' : 'Locked',
+            background: earned ? _Palette.mint : _Palette.lavenderSoft,
+            foreground: earned ? Colors.green.shade800 : _Palette.purple,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Activity completion
+// ---------------------------------------------------------------------------
+
+Future<void> _openKidsActivity(
+  BuildContext context, {
+  required KidsProgressService service,
+  required String id,
+  required String title,
+  required String emoji,
+  required bool isLesson,
+}) async {
+  final content = <String, String>{
+    'sign_of_cross':
+        'In the name of the Father, and of the Son, and of the Holy Spirit. Amen.\n\nTouch your forehead, chest, left shoulder, then right shoulder as you say the words.',
+    'our_father':
+        'Our Father, who art in heaven, hallowed be thy name; thy kingdom come; thy will be done on earth as it is in heaven.\n\nGive us this day our daily bread; and forgive us our trespasses, as we forgive those who trespass against us; and lead us not into temptation, but deliver us from evil. Amen.',
+    'hail_mary':
+        'Hail Mary, full of grace, the Lord is with thee. Blessed art thou among women, and blessed is the fruit of thy womb, Jesus. Holy Mary, Mother of God, pray for us sinners, now and at the hour of our death. Amen.',
+    'jesus_children':
+        'People brought children to Jesus. His disciples tried to send them away, but Jesus welcomed the children and blessed them. Jesus showed that every child is precious to God.',
+    'garden_eden':
+        'God created a beautiful garden called Eden. He made trees, rivers, plants and animals. Creation reminds us to thank God and care for the world.',
+    'joyful_mysteries':
+        'The Joyful Mysteries: The Annunciation; The Visitation; The Nativity; The Presentation; The Finding of Jesus in the Temple.',
+    'sorrowful_mysteries':
+        'The Sorrowful Mysteries: The Agony in the Garden; The Scourging at the Pillar; The Crowning with Thorns; The Carrying of the Cross; The Crucifixion.',
+    'glorious_mysteries':
+        'The Glorious Mysteries: The Resurrection; The Ascension; The Descent of the Holy Spirit; The Assumption of Mary; The Coronation of Mary.',
+    'luminous_mysteries':
+        'The Luminous Mysteries: The Baptism of Jesus; The Wedding at Cana; The Proclamation of the Kingdom; The Transfiguration; The Institution of the Eucharist.',
+  };
+
+  final progress = await service.watch().first;
+
+  final completed = isLesson
+      ? progress.completedLessons.contains(id)
+      : progress.completedPrayers.contains(id);
+
+  if (!context.mounted) return;
+
+  await showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    backgroundColor: Colors.white,
+    showDragHandle: true,
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(
+        top: Radius.circular(28),
+      ),
+    ),
+    builder: (sheetContext) {
+      return SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(22, 8, 22, 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Center(
+                child: Text(
+                  emoji,
+                  style: const TextStyle(fontSize: 48),
+                ),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                title,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: _Palette.ink,
+                  fontWeight: FontWeight.w900,
+                  fontSize: 22,
+                ),
+              ),
+              const SizedBox(height: 14),
+              ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxHeight:
+                      MediaQuery.of(sheetContext).size.height * 0.48,
+                ),
+                child: SingleChildScrollView(
+                  child: Text(
+                    content[id] ??
+                        'Take a quiet moment to learn and pray.',
+                    style: const TextStyle(
+                      color: _Palette.ink,
+                      fontSize: 16,
+                      height: 1.65,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 18),
+              FilledButton.icon(
+                onPressed: completed
+                    ? null
+                    : () async {
+                        try {
+                          if (isLesson) {
+                            await service.completeLesson(id);
+                          } else {
+                            await service.completePrayer(id);
+                          }
+
+                          if (sheetContext.mounted) {
+                            Navigator.pop(sheetContext);
+                          }
+
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text(
+                                  'Completed! You earned 5 stars. â­',
+                                ),
+                              ),
+                            );
+                          }
+                        } catch (e) {
+                          if (sheetContext.mounted) {
+                            ScaffoldMessenger.of(sheetContext)
+                                .showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  'Could not save progress: $e',
+                                ),
+                              ),
+                            );
+                          }
+                        }
+                      },
+                icon: Icon(
+                  completed
+                      ? Icons.check_circle
+                      : Icons.star_rounded,
+                ),
+                label: Text(
+                  completed
+                      ? 'Already completed'
+                      : 'Mark complete Â· Earn 5 stars',
+                ),
+                style: FilledButton.styleFrom(
+                  backgroundColor: _Palette.purple,
+                  minimumSize: const Size.fromHeight(52),
+                ),
+              ),
+              const SizedBox(height: 8),
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(sheetContext);
+                },
+                child: const Text('Close'),
+              ),
+            ],
+          ),
+        ),
+      );
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+class _Pressable extends StatefulWidget {
+  final Widget child;
+  final VoidCallback onTap;
+  final String semanticLabel;
+
+  const _Pressable({
+    required this.child,
+    required this.onTap,
+    required this.semanticLabel,
+  });
+
+  @override
+  State<_Pressable> createState() => _PressableState();
+}
+
+class _PressableState extends State<_Pressable> {
+  bool _pressed = false;
+
+  void _setPressed(bool value) {
+    if (_pressed != value) {
+      setState(() => _pressed = value);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      button: true,
+      label: widget.semanticLabel,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTapDown: (_) => _setPressed(true),
+        onTapCancel: () => _setPressed(false),
+        onTapUp: (_) => _setPressed(false),
+        onTap: widget.onTap,
+        child: AnimatedScale(
+          scale: _pressed ? 0.97 : 1,
+          duration: const Duration(milliseconds: 110),
+          curve: Curves.easeOut,
+          child: ExcludeSemantics(
+            child: widget.child,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _Blob extends StatelessWidget {
+  final double size;
+  final Color color;
+
+  const _Blob({
+    required this.size,
+    required this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: size,
+      width: size,
+      decoration: BoxDecoration(
+        color: color,
+        shape: BoxShape.circle,
+      ),
+    );
+  }
+}
+
+class _SectionTitle extends StatelessWidget {
+  final String text;
+
+  const _SectionTitle(this.text);
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(
+      text,
+      style: const TextStyle(
+        color: _Palette.ink,
+        fontWeight: FontWeight.w900,
+        fontSize: 20,
+      ),
+    );
+  }
+}
+
+class _PageHeading extends StatelessWidget {
+  final String emoji;
+  final String title;
+  final String subtitle;
+
+  const _PageHeading({
+    required this.emoji,
+    required this.title,
+    required this.subtitle,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Container(
+          height: 72,
+          width: 72,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: _Palette.border),
+          ),
+          child: Text(
+            emoji,
+            style: const TextStyle(fontSize: 38),
+          ),
+        ),
+        const SizedBox(width: 16),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                style: const TextStyle(
+                  color: _Palette.ink,
+                  fontSize: 26,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                subtitle,
+                style: const TextStyle(
+                  color: _Palette.muted,
+                  fontSize: 13,
+                  height: 1.4,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _PreviewNote extends StatelessWidget {
+  final String text;
+
+  const _PreviewNote(this.text);
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: _Palette.lavenderSoft,
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(
+            Icons.info_outline_rounded,
+            size: 18,
+            color: _Palette.purple,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(
+                color: _Palette.muted,
+                fontSize: 12,
+                height: 1.45,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SoonPill extends StatelessWidget {
+  final String label;
+  final Color background;
+  final Color foreground;
+
+  const _SoonPill({
+    this.label = 'Soon',
+    this.background = _Palette.lavenderSoft,
+    this.foreground = _Palette.purple,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(
+        horizontal: 10,
+        vertical: 4,
+      ),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: foreground,
+          fontSize: 10,
+          fontWeight: FontWeight.w900,
+          letterSpacing: 0.3,
+        ),
+      ),
+    );
+  }
+}
+
+class _MiniStat extends StatelessWidget {
+  final String emoji;
+  final String title;
+  final String value;
+  final Color color;
+
+  const _MiniStat({
+    required this.emoji,
+    required this.title,
+    required this.value,
+    required this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(24),
+      ),
+      child: Row(
+        children: [
+          Container(
+            height: 48,
+            width: 48,
+            alignment: Alignment.center,
+            decoration: const BoxDecoration(
+              color: Colors.white,
+              shape: BoxShape.circle,
+            ),
+            child: Text(
+              emoji,
+              style: const TextStyle(fontSize: 24),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  value,
+                  style: const TextStyle(
+                    color: _Palette.ink,
+                    fontWeight: FontWeight.w900,
+                    fontSize: 24,
+                    height: 1.1,
+                  ),
+                ),
+                Text(
+                  title,
+                  style: const TextStyle(
+                    color: _Palette.ink,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TwoColumn extends StatelessWidget {
+  final List<Widget> children;
+
+  const _TwoColumn({
+    required this.children,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final rows = <Widget>[];
+
+    for (var i = 0; i < children.length; i += 2) {
+      final second =
+          i + 1 < children.length ? children[i + 1] : null;
+
+      rows.add(
+        Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: IntrinsicHeight(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(child: children[i]),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: second ?? const SizedBox.shrink(),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Column(children: rows);
+  }
+}
+
+class _ProgressRow extends StatelessWidget {
+  final String label;
+  final int value;
+  final int total;
+  final Color color;
+  final Color trackColor;
+
+  const _ProgressRow({
+    required this.label,
+    required this.value,
+    required this.total,
+    required this.color,
+    required this.trackColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final fraction =
+        total == 0 ? 0.0 : (value / total).clamp(0.0, 1.0);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                label,
+                style: const TextStyle(
+                  color: _Palette.ink,
+                  fontWeight: FontWeight.w800,
+                  fontSize: 13,
+                ),
+              ),
+            ),
+            Text(
+              '$value / $total',
+              style: const TextStyle(
+                color: _Palette.ink,
+                fontWeight: FontWeight.w900,
+                fontSize: 13,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(10),
+          child: LinearProgressIndicator(
+            value: fraction,
+            minHeight: 14,
+            backgroundColor: trackColor,
+            valueColor: AlwaysStoppedAnimation<Color>(color),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+
+===== lib\screens\kids_rosary_guide_screen.dart =====
+import 'dart:async';
+
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/material.dart';
+import 'package:just_audio/just_audio.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+import '../services/kids_progress_service.dart';
+
+/// A child-friendly, step-by-step Rosary guide.
+///
+/// Prayer text and audio are taken from published `prayers` documents when a
+/// matching record exists. The traditional text below is the offline/fallback
+/// lesson text. Audio is requested through the existing secure Supabase Edge
+/// Function; the Supabase secret key never enters the Flutter application.
+class KidsRosaryGuideScreen extends StatefulWidget {
+  final KidsProgressService progressService;
+
+  const KidsRosaryGuideScreen({
+    super.key,
+    required this.progressService,
+  });
+
+  @override
+  State<KidsRosaryGuideScreen> createState() => _KidsRosaryGuideScreenState();
+}
+
+class _KidsRosaryGuideScreenState extends State<KidsRosaryGuideScreen> {
+  static const Color _purple = Color(0xFF7654D6);
+  static const Color _ink = Color(0xFF34265D);
+  static const Color _muted = Color(0xFF81758F);
+  static const Color _lavender = Color(0xFFECE3FF);
+
+  late final AudioPlayer _player;
+  late List<_RosaryStep> _steps;
+  String _selectedMysteryKey = 'joyful';
+  int _stepIndex = 0;
+  int _repeatIndex = 1;
+  int _activeWordIndex = -1;
+  bool _requestingAudio = false;
+  String? _audioError;
+  StreamSubscription<Duration>? _positionSubscription;
+  Duration _audioPosition = Duration.zero;
+  Duration? _audioDuration;
+
+  _RosaryStep get _step => _steps[_stepIndex];
+
+  @override
+  void initState() {
+    super.initState();
+    _player = AudioPlayer();
+    _steps = _buildRosarySteps(_selectedMysteryKey);
+    _positionSubscription = _player.positionStream.listen(_updateActiveWord);
+    _player.durationStream.listen((duration) {
+      if (mounted) setState(() => _audioDuration = duration);
+    });
+    _player.playerStateStream.listen((state) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _positionSubscription?.cancel();
+    _player.dispose();
+    super.dispose();
+  }
+
+  List<_RosaryStep> _buildRosarySteps(String mysteryKey) {
+    final steps = <_RosaryStep>[
+      _RosaryStep(
+        id: 'sign_of_cross', title: 'Sign of the Cross', emoji: 'âœï¸',
+        kind: 'Opening prayer', prayerId: 'sign_of_cross',
+        text: 'In the name of the Father, and of the Son, and of the Holy Spirit. Amen.',
+        lesson: 'Begin by making the Sign of the Cross. Touch your forehead, your chest, your left shoulder, and your right shoulder as you pray.',
+      ),
+      _RosaryStep(
+        id: 'apostles_creed', title: 'Apostlesâ€™ Creed', emoji: 'ðŸ“œ',
+        kind: 'Profession of faith', prayerId: 'apostles_creed',
+        text: 'I believe in God, the Father almighty, Creator of heaven and earth, and in Jesus Christ, his only Son, our Lord, who was conceived by the Holy Spirit, born of the Virgin Mary, suffered under Pontius Pilate, was crucified, died and was buried; he descended into hell; on the third day he rose again from the dead; he ascended into heaven, and is seated at the right hand of God the Father almighty; from there he will come to judge the living and the dead. I believe in the Holy Spirit, the holy Catholic Church, the communion of saints, the forgiveness of sins, the resurrection of the body, and life everlasting. Amen.',
+        lesson: 'The Creed is a short summary of what Catholics believe. Take your time and listen carefully.',
+      ),
+      _RosaryStep(
+        id: 'our_father_opening', title: 'Our Father', emoji: 'ðŸ¤',
+        kind: 'Opening prayer', prayerId: 'our_father',
+        text: _ourFather,
+        lesson: 'Jesus taught this prayer to his disciples. We pray it with trust in our loving Father.',
+      ),
+    ];
+
+    for (var i = 1; i <= 3; i++) {
+      steps.add(_RosaryStep(
+        id: i == 1 ? 'hail_mary' : 'opening_hail_mary_$i', title: 'Hail Mary', emoji: 'ðŸŒ¹',
+        kind: 'Opening prayer Â· $i of 3', prayerId: 'hail_mary',
+        text: _hailMary,
+        lesson: 'Offer this Hail Mary for an increase in faith, hope, and love.',
+      ));
+    }
+
+    steps.add(_RosaryStep(
+      id: 'opening_glory_be', title: 'Glory Be', emoji: 'âœ¨',
+      kind: 'Opening prayer', prayerId: 'glory_be', text: _gloryBe,
+      lesson: 'Give glory to the Father, the Son, and the Holy Spirit.',
+    ));
+
+    const mysteries = [
+      ('joyful', 'Joyful Mysteries', 'â˜€ï¸', 'Monday and Saturday', [
+        'The Annunciation', 'The Visitation', 'The Nativity',
+        'The Presentation of Jesus in the Temple', 'The Finding of Jesus in the Temple',
+      ]),
+      ('sorrowful', 'Sorrowful Mysteries', 'ðŸ’§', 'Tuesday and Friday', [
+        'The Agony of Jesus in the Garden', 'The Scourging at the Pillar',
+        'The Crowning with Thorns', 'The Carrying of the Cross', 'The Crucifixion',
+      ]),
+      ('glorious', 'Glorious Mysteries', 'ðŸ‘‘', 'Wednesday and Sunday', [
+        'The Resurrection', 'The Ascension', 'The Descent of the Holy Spirit',
+        'The Assumption of Mary', 'The Coronation of Mary',
+      ]),
+      ('luminous', 'Luminous Mysteries', 'ðŸ’›', 'Thursday', [
+        'The Baptism of Jesus in the Jordan', 'The Wedding at Cana',
+        'The Proclamation of the Kingdom of God', 'The Transfiguration',
+        'The Institution of the Eucharist',
+      ]),
+    ];
+
+    // A Rosary uses one mystery set per journey. The child can change
+    // the selected set from the selector at the top of this screen.
+    final mysterySet = mysteries.firstWhere((item) => item.$1 == mysteryKey);
+    for (var decade = 0; decade < 5; decade++) {
+      final mysteryName = mysterySet.$5[decade];
+      final prefix = '${mysterySet.$1}_${decade + 1}';
+      steps.add(_RosaryStep(
+        id: '${prefix}_mystery', title: 'Mystery ${decade + 1}: $mysteryName',
+        emoji: mysterySet.$3, kind: '${mysterySet.$2} Â· ${decade + 1} of 5',
+        prayerId: '', text: '',
+        lesson: 'Pause and think about $mysteryName. What can this mystery teach you about Jesus and his love?',
+        isReflection: true,
+      ));
+      steps.add(_RosaryStep(
+        id: '${prefix}_our_father', title: 'Our Father', emoji: 'ðŸ¤',
+        kind: 'Decade ${decade + 1} Â· Opening prayer', prayerId: 'our_father',
+        text: _ourFather, lesson: 'Begin this decade with the Our Father.',
+      ));
+      steps.add(_RosaryStep(
+        id: '${prefix}_hail_mary', title: 'Hail Mary', emoji: 'ðŸŒ¹',
+        kind: 'Decade ${decade + 1} Â· 10 prayers', prayerId: 'hail_mary',
+        text: _hailMary, lesson: 'Pray each Hail Mary slowly while thinking about the mystery.',
+        repeatCount: 10,
+      ));
+      steps.add(_RosaryStep(
+        id: '${prefix}_glory_be', title: 'Glory Be', emoji: 'âœ¨',
+        kind: 'Decade ${decade + 1} Â· Closing prayer', prayerId: 'glory_be',
+        text: _gloryBe, lesson: 'Give thanks to the Holy Trinity.',
+      ));
+      steps.add(_RosaryStep(
+        id: '${prefix}_fatima', title: 'Fatima Prayer', emoji: 'ðŸ•Šï¸',
+        kind: 'Decade ${decade + 1} Â· Optional traditional prayer',
+        prayerId: 'fatima_prayer', text: _fatimaPrayer,
+        lesson: 'This prayer is traditionally said after each decade.',
+      ));
+    }
+
+    steps.add(_RosaryStep(
+      id: 'hail_holy_queen', title: 'Hail, Holy Queen', emoji: 'ðŸŒ¹',
+      kind: 'Closing prayer', prayerId: 'hail_holy_queen',
+      text: _hailHolyQueen,
+      lesson: 'We ask Mary to pray for us and lead us closer to Jesus.',
+    ));
+    steps.add(_RosaryStep(
+      id: 'closing_sign_of_cross', title: 'Sign of the Cross', emoji: 'âœï¸',
+      kind: 'Finish your Rosary', prayerId: 'sign_of_cross',
+      text: 'In the name of the Father, and of the Son, and of the Holy Spirit. Amen.',
+      lesson: 'You have reached the end of this Rosary journey. Make the Sign of the Cross.',
+    ));
+    return steps;
+  }
+
+  static const String _ourFather = 'Our Father, who art in heaven, hallowed be thy name; thy kingdom come; thy will be done on earth as it is in heaven. Give us this day our daily bread; and forgive us our trespasses, as we forgive those who trespass against us; and lead us not into temptation, but deliver us from evil. Amen.';
+  static const String _hailMary = 'Hail Mary, full of grace, the Lord is with thee. Blessed art thou among women, and blessed is the fruit of thy womb, Jesus. Holy Mary, Mother of God, pray for us sinners, now and at the hour of our death. Amen.';
+  static const String _gloryBe = 'Glory be to the Father, and to the Son, and to the Holy Spirit, as it was in the beginning, is now, and ever shall be, world without end. Amen.';
+  static const String _fatimaPrayer = 'O my Jesus, forgive us our sins, save us from the fires of hell, lead all souls to heaven, especially those in most need of thy mercy. Amen.';
+  static const String _hailHolyQueen = 'Hail, Holy Queen, Mother of mercy, our life, our sweetness, and our hope. To thee do we cry, poor banished children of Eve. To thee do we send up our sighs, mourning and weeping in this valley of tears. Turn then, most gracious advocate, thine eyes of mercy toward us, and after this our exile, show unto us the blessed fruit of thy womb, Jesus. O clement, O loving, O sweet Virgin Mary. Pray for us, O holy Mother of God, that we may be made worthy of the promises of Christ. Amen.';
+
+  void _updateActiveWord(Duration position) {
+    _audioPosition = position;
+    final prayer = _matchingPrayer(_currentPrayerDocs);
+    final text = _displayText(prayer);
+    final words = _words(text);
+    if (words.isEmpty) return;
+
+    int index;
+    final timings = prayer?['wordTimings'] ?? prayer?['word_timestamps'];
+    if (timings is List && timings.isNotEmpty) {
+      index = -1;
+      for (var i = 0; i < timings.length && i < words.length; i++) {
+        final item = timings[i];
+        if (item is Map) {
+          final start = (item['start'] ?? item['startSeconds'] ?? 0) as num;
+          final end = (item['end'] ?? item['endSeconds'] ?? start) as num;
+          if (position.inMilliseconds >= start * 1000 &&
+              position.inMilliseconds <= end * 1000) {
+            index = i;
+            break;
+          }
+        }
+      }
+      if (index < 0) {
+        index = ((position.inMilliseconds / 1000) /
+                ((_audioDuration?.inMilliseconds ?? 1) / 1000) * words.length)
+            .floor()
+            .clamp(0, words.length - 1).toInt();
+      }
+    } else {
+      // Fallback estimate: evenly distribute words across the recording.
+      // Add wordTimings to a prayer document for precise word-level alignment.
+      final totalMs = _audioDuration?.inMilliseconds ?? 0;
+      index = totalMs <= 0
+          ? -1
+          : ((position.inMilliseconds / totalMs) * words.length)
+              .floor()
+              .clamp(0, words.length - 1).toInt();
+    }
+
+    if (mounted && index != _activeWordIndex) {
+      setState(() => _activeWordIndex = index);
+    }
+  }
+
+  List<Map<String, dynamic>> _currentPrayerDocs = const [];
+
+  Map<String, dynamic>? _matchingPrayer(List<Map<String, dynamic>> prayers) {
+    if (_step.prayerId.isEmpty) return null;
+    final wanted = _step.prayerId.replaceAll(RegExp(r'[^a-z0-9]'), '').toLowerCase();
+    final titleAliases = <String, Set<String>>{
+      'signofcross': {'signofthecross', 'thesignofthecross'},
+    };
+    for (final prayer in prayers) {
+      final title = (prayer['title'] ?? '')
+          .toString()
+          .toLowerCase()
+          .replaceAll(RegExp(r'[^a-z0-9]'), '');
+      final id = (prayer['_id'] ?? '').toString().toLowerCase();
+      if (title == wanted ||
+          (titleAliases[wanted]?.contains(title) ?? false) ||
+          id == _step.prayerId) {
+        return prayer;
+      }
+    }
+    return null;
+  }
+
+  String _displayText(Map<String, dynamic>? prayer) {
+    final stored = prayer?['text'] ?? prayer?['content'] ?? prayer?['body'];
+    if (stored is String && stored.trim().isNotEmpty) return stored.trim();
+    return _step.text;
+  }
+
+  List<String> _words(String text) =>
+      text.split(RegExp(r'\s+')).where((word) => word.isNotEmpty).toList();
+
+  Future<void> _playPrayer(Map<String, dynamic>? prayer) async {
+    final path = prayer?['audioPath'];
+    if (path is! String || path.trim().isEmpty) {
+      setState(() => _audioError = 'Audio has not been added to this prayer yet.');
+      return;
+    }
+    setState(() {
+      _requestingAudio = true;
+      _audioError = null;
+    });
+    try {
+      final user = FirebaseAuth.instance.currentUser;
+      if (user == null) throw Exception('Please sign in again to play prayer audio.');
+      final supabase = Supabase.instance.client;
+      final token = await user.getIdToken();
+      final response = await supabase.functions.invoke(
+        'get-prayer-audio-url',
+        headers: {'Authorization': 'Bearer ${token ?? ''}'},
+        body: {'path': path},
+      );
+      final data = response.data;
+      final result = data is Map<String, dynamic>
+          ? data
+          : data is Map
+              ? Map<String, dynamic>.from(data)
+              : <String, dynamic>{};
+      final signedUrl = result['signedUrl'];
+      if (signedUrl is! String || signedUrl.isEmpty) {
+        throw Exception('The audio service did not return a playback URL.');
+      }
+      await _player.setUrl(signedUrl);
+      _audioPosition = Duration.zero;
+      _activeWordIndex = -1;
+      await _player.play();
+    } catch (error) {
+      if (mounted) setState(() => _audioError = error.toString().replaceFirst('Exception: ', ''));
+    } finally {
+      if (mounted) setState(() => _requestingAudio = false);
+    }
+  }
+
+  Future<void> _goNext() async {
+    if (_step.repeatCount > 1 && _repeatIndex < _step.repeatCount) {
+      setState(() => _repeatIndex++);
+      await _player.stop();
+      return;
+    }
+    await _markStepComplete();
+    if (_stepIndex < _steps.length - 1) {
+      await _player.stop();
+      setState(() {
+        _stepIndex++;
+        _repeatIndex = 1;
+        _activeWordIndex = -1;
+        _audioError = null;
+      });
+    } else if (mounted) {
+      _showFinished();
+    }
+  }
+
+  Future<void> _goPrevious() async {
+    if (_step.repeatCount > 1 && _repeatIndex > 1) {
+      setState(() => _repeatIndex--);
+      await _player.stop();
+      return;
+    }
+    if (_stepIndex == 0) return;
+    await _player.stop();
+    setState(() {
+      _stepIndex--;
+      _repeatIndex = _step.repeatCount > 1 ? _step.repeatCount : 1;
+      _activeWordIndex = -1;
+      _audioError = null;
+    });
+  }
+
+  Future<void> _markStepComplete() async {
+    if (_step.isReflection) return;
+    try {
+      await widget.progressService.completePrayer(_step.id);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not save this step: $error')),
+        );
+      }
+    }
+  }
+
+  void _showFinished() {
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Rosary journey complete! â­'),
+        content: const Text('Wonderful work. You have finished this guided Rosary journey.'),
+        actions: [
+          TextButton(onPressed: () { Navigator.pop(context); Navigator.pop(this.context); }, child: const Text('Finish')),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final progress = (_stepIndex + 1) / _steps.length;
+    return Scaffold(
+      backgroundColor: const Color(0xFFFFFBF4),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFFFFFBF4),
+        foregroundColor: _ink,
+        elevation: 0,
+        title: const Text('Guided Rosary', style: TextStyle(fontWeight: FontWeight.w900)),
+      ),
+      body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+        stream: FirebaseFirestore.instance
+            .collection('prayers')
+            .where('published', isEqualTo: true)
+            .snapshots(),
+        builder: (context, snapshot) {
+          _currentPrayerDocs = snapshot.data?.docs.map((doc) => {
+            ...doc.data(), '_id': doc.id,
+          }).toList() ?? const [];
+          final prayer = _matchingPrayer(_currentPrayerDocs);
+          final text = _displayText(prayer);
+          final words = _words(text);
+          return SafeArea(
+            child: Column(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          const Expanded(
+                            child: Text('MYSTERY SET', style: TextStyle(color: _muted, fontSize: 10, fontWeight: FontWeight.w900, letterSpacing: 1)),
+                          ),
+                          DropdownButton<String>(
+                            value: _selectedMysteryKey,
+                            underline: const SizedBox.shrink(),
+                            borderRadius: BorderRadius.circular(14),
+                            items: const [
+                              DropdownMenuItem(value: 'joyful', child: Text('Joyful')),
+                              DropdownMenuItem(value: 'sorrowful', child: Text('Sorrowful')),
+                              DropdownMenuItem(value: 'glorious', child: Text('Glorious')),
+                              DropdownMenuItem(value: 'luminous', child: Text('Luminous')),
+                            ],
+                            onChanged: (value) {
+                              if (value == null) return;
+                              setState(() {
+                                _selectedMysteryKey = value;
+                                _steps = _buildRosarySteps(value);
+                                _stepIndex = 0;
+                                _repeatIndex = 1;
+                                _activeWordIndex = -1;
+                              });
+                              _player.stop();
+                            },
+                          ),
+                        ],
+                      ),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text('STEP ${_stepIndex + 1} OF ${_steps.length}', style: const TextStyle(color: _muted, fontSize: 11, fontWeight: FontWeight.w900, letterSpacing: 1)),
+                          Text('${(progress * 100).round()}%', style: const TextStyle(color: _purple, fontWeight: FontWeight.w900)),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(20),
+                        child: LinearProgressIndicator(value: progress, minHeight: 9, backgroundColor: _lavender, color: _purple),
+                      ),
+                    ],
+                  ),
+                ),
+                Expanded(
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(24),
+                          decoration: BoxDecoration(
+                            gradient: const LinearGradient(colors: [Color(0xFF9476F2), Color(0xFF5B3BB5)]),
+                            borderRadius: BorderRadius.circular(30),
+                          ),
+                          child: Column(
+                            children: [
+                              Text(_step.emoji, style: const TextStyle(fontSize: 48)),
+                              const SizedBox(height: 12),
+                              Text(_step.kind.toUpperCase(), textAlign: TextAlign.center, style: const TextStyle(color: Color(0xFFEDE5FF), fontSize: 10, fontWeight: FontWeight.w900, letterSpacing: 1)),
+                              const SizedBox(height: 8),
+                              Text(_step.title, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.w900)),
+                              if (_step.repeatCount > 1) ...[
+                                const SizedBox(height: 10),
+                                Text('Hail Mary $_repeatIndex of ${_step.repeatCount}', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w800)),
+                              ],
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 18),
+                        Container(
+                          padding: const EdgeInsets.all(20),
+                          decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(24), border: Border.all(color: const Color(0xFFEDE7F7))),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text('LETâ€™S LEARN', style: TextStyle(color: _purple, fontSize: 11, fontWeight: FontWeight.w900, letterSpacing: 1)),
+                              const SizedBox(height: 8),
+                              Text(_step.lesson, style: const TextStyle(color: _muted, fontSize: 14, height: 1.5)),
+                              if (text.isNotEmpty) ...[
+                                const SizedBox(height: 18),
+                                const Divider(height: 1),
+                                const SizedBox(height: 16),
+                                const Text('SAY THE PRAYER', style: TextStyle(color: _purple, fontSize: 11, fontWeight: FontWeight.w900, letterSpacing: 1)),
+                                const SizedBox(height: 12),
+                                _buildHighlightedPrayer(words),
+                              ],
+                            ],
+                          ),
+                        ),
+                        if (!_step.isReflection) ...[
+                          const SizedBox(height: 16),
+                          OutlinedButton.icon(
+                            onPressed: _requestingAudio ? null : () => _player.playing ? _player.pause() : _playPrayer(prayer),
+                            icon: _requestingAudio
+                                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                                : Icon(_player.playing ? Icons.pause_rounded : Icons.volume_up_rounded),
+                            label: Text(_requestingAudio ? 'Preparing audioâ€¦' : (_player.playing ? 'Pause prayer audio' : 'Listen to prayer')),
+                            style: OutlinedButton.styleFrom(foregroundColor: _purple, side: const BorderSide(color: _lavender), minimumSize: const Size.fromHeight(52), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(17))),
+                          ),
+                          if (prayer == null || (prayer['audioPath'] ?? '').toString().isEmpty)
+                            const Padding(
+                              padding: EdgeInsets.only(top: 8),
+                              child: Text('You can still read and practise this prayer. Audio has not been linked to this prayer in the library yet.', textAlign: TextAlign.center, style: TextStyle(color: _muted, fontSize: 12)),
+                            ),
+                          if (_audioError != null)
+                            Padding(padding: const EdgeInsets.only(top: 8), child: Text(_audioError!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.red, fontSize: 12))),
+                          if (prayer?['wordTimings'] == null && prayer?['word_timestamps'] == null && _audioDuration != null)
+                            const Padding(
+                              padding: EdgeInsets.only(top: 8),
+                              child: Text('Word highlighting is estimated from the recording length. Add wordTimings to the prayer record for exact word-by-word sync.', textAlign: TextAlign.center, style: TextStyle(color: _muted, fontSize: 11)),
+                            ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+                Container(
+                  padding: const EdgeInsets.fromLTRB(20, 12, 20, 16),
+                  decoration: const BoxDecoration(color: Colors.white, border: Border(top: BorderSide(color: Color(0xFFEDE7F7)))),
+                  child: Row(
+                    children: [
+                      Expanded(child: OutlinedButton(onPressed: _stepIndex == 0 && _repeatIndex == 1 ? null : _goPrevious, style: OutlinedButton.styleFrom(minimumSize: const Size.fromHeight(52), foregroundColor: _purple), child: const Text('Back'))),
+                      const SizedBox(width: 12),
+                      Expanded(flex: 2, child: FilledButton(onPressed: _goNext, style: FilledButton.styleFrom(backgroundColor: _purple, minimumSize: const Size.fromHeight(52), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16))), child: Text(_step.repeatCount > 1 && _repeatIndex < _step.repeatCount ? 'Next Hail Mary' : (_stepIndex == _steps.length - 1 ? 'Finish Rosary' : 'Continue')))),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildHighlightedPrayer(List<String> words) {
+    if (words.isEmpty) return const SizedBox.shrink();
+    return Wrap(
+      spacing: 4,
+      runSpacing: 8,
+      children: [
+        for (var i = 0; i < words.length; i++)
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 120),
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+            decoration: BoxDecoration(
+              color: i == _activeWordIndex ? const Color(0xFFFFE59A) : Colors.transparent,
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Text(words[i], style: TextStyle(color: _ink, fontSize: 17, height: 1.6, fontWeight: i == _activeWordIndex ? FontWeight.w900 : FontWeight.w500)),
+          ),
+      ],
+    );
+  }
+}
+
+class _RosaryStep {
+  final String id;
+  final String title;
+  final String emoji;
+  final String kind;
+  final String prayerId;
+  final String text;
+  final String lesson;
+  final int repeatCount;
+  final bool isReflection;
+
+  const _RosaryStep({
+    required this.id,
+    required this.title,
+    required this.emoji,
+    required this.kind,
+    required this.prayerId,
+    required this.text,
+    required this.lesson,
+    this.repeatCount = 1,
+    this.isReflection = false,
+  });
+}
+
+
+===== lib\services\kids_progress_service.dart =====
+
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+
+/// Progress is isolated by child identity.
+///
+/// Independent child:
+/// users/{childUid}/kidsProgress/main
+///
+/// Parent-managed child:
+/// users/{parentUid}/kids/{childProfileId}/progress/main
+///
+/// Guided sessions are stored below the selected progress document.
+class KidsProgressService {
+  KidsProgressService._(this._ref);
+
+  final DocumentReference<Map<String, dynamic>> _ref;
+
+  factory KidsProgressService.independent(String uid) {
+    return KidsProgressService._(
+      FirebaseFirestore.instance
+          .collection('users')
+          .doc(uid)
+          .collection('kidsProgress')
+          .doc('main'),
+    );
+  }
+
+  factory KidsProgressService.parentManaged({
+    required String parentUid,
+    required String childProfileId,
+  }) {
+    return KidsProgressService._(
+      FirebaseFirestore.instance
+          .collection('users')
+          .doc(parentUid)
+          .collection('kids')
+          .doc(childProfileId)
+          .collection('progress')
+          .doc('main'),
+    );
+  }
+
+factory KidsProgressService.forChild({
+  required String uid,
+  String? parentUid,
+  String? childProfileId,
+}) {
+  if (parentUid != null &&
+      parentUid.isNotEmpty &&
+      childProfileId != null &&
+      childProfileId.isNotEmpty) {
+    return KidsProgressService.parentManaged(
+      parentUid: parentUid,
+      childProfileId: childProfileId,
+    );
+  }
+
+  return KidsProgressService.independent(uid);
+}
+
+
+
+  factory KidsProgressService.forCurrentUser() {
+    final user = FirebaseAuth.instance.currentUser;
+
+    if (user == null) {
+      throw StateError('No authenticated user for Kids Mode.');
+    }
+
+    return KidsProgressService.independent(user.uid);
+  }
+
+  Stream<KidsProgress> watch() {
+    return _ref.snapshots().map(KidsProgress.fromMap);
+  }
+
+  Future<void> completeLesson(String lessonId) {
+    return _completeOnce(
+      field: 'completedLessons',
+      id: lessonId,
+      awardStars: 5,
+    );
+  }
+
+  Future<void> completePrayer(String prayerDocumentId) {
+    return _completeOnce(
+      field: 'completedPrayers',
+      id: prayerDocumentId,
+      awardStars: 5,
+      markPrayerDay: true,
+    );
+  }
+
+  /// Records newly listened seconds from the guided player.
+  /// Set completed=true only when the activity actually finishes.
+  Future<void> recordGuidedPlayback({
+    required String prayerDocumentId,
+    required int listenedSecondsDelta,
+    int? durationSeconds,
+    bool completed = false,
+  }) async {
+    if (prayerDocumentId.trim().isEmpty) {
+      throw ArgumentError.value(
+        prayerDocumentId,
+        'prayerDocumentId',
+        'Must be a Firestore prayers document ID.',
+      );
+    }
+
+    final delta =
+        listenedSecondsDelta < 0 ? 0 : listenedSecondsDelta;
+
+    final sessionRef =
+        _ref.collection('guidedSessions').doc(prayerDocumentId);
+
+    await FirebaseFirestore.instance.runTransaction((transaction) async {
+      final progressSnapshot = await transaction.get(_ref);
+      final sessionSnapshot = await transaction.get(sessionRef);
+
+      final progress =
+          progressSnapshot.data() ?? <String, dynamic>{};
+      final session =
+          sessionSnapshot.data() ?? <String, dynamic>{};
+
+      final completedPrayers = List<String>.from(
+        progress['completedPrayers'] ?? const <String>[],
+      );
+
+      final alreadyCompleted =
+          session['completed'] == true ||
+          completedPrayers.contains(prayerDocumentId);
+
+      final award = completed && !alreadyCompleted;
+
+      final stars = progress['stars'] is num
+          ? (progress['stars'] as num).toInt()
+          : 0;
+
+      final listened = session['listenedSeconds'] is num
+          ? (session['listenedSeconds'] as num).toInt()
+          : 0;
+
+      final sessionUpdate = <String, dynamic>{
+        'prayerId': prayerDocumentId,
+        'listenedSeconds': listened + delta,
+        'completed': completed || alreadyCompleted,
+        'updatedAt': FieldValue.serverTimestamp(),
+        'lastPlayedAt': FieldValue.serverTimestamp(),
+      };
+
+      if (durationSeconds != null && durationSeconds > 0) {
+        sessionUpdate['durationSeconds'] = durationSeconds;
+      }
+
+      if (completed && !alreadyCompleted) {
+        sessionUpdate['completedAt'] =
+            FieldValue.serverTimestamp();
+      }
+
+      transaction.set(
+        sessionRef,
+        sessionUpdate,
+        SetOptions(merge: true),
+      );
+
+      final progressUpdate = <String, dynamic>{
+        'updatedAt': FieldValue.serverTimestamp(),
+      };
+
+      if (delta > 0 || completed) {
+        progressUpdate['prayerDays'] =
+            FieldValue.arrayUnion([_todayKey()]);
+      }
+
+      if (completed) {
+        progressUpdate['completedPrayers'] =
+            FieldValue.arrayUnion([prayerDocumentId]);
+      }
+
+      if (award) {
+        progressUpdate['stars'] = stars + 5;
+      }
+
+      transaction.set(
+        _ref,
+        progressUpdate,
+        SetOptions(merge: true),
+      );
+    });
+  }
+
+  Future<void> _completeOnce({
+    required String field,
+    required String id,
+    required int awardStars,
+    bool markPrayerDay = false,
+  }) async {
+    if (id.trim().isEmpty) {
+      throw ArgumentError.value(
+        id,
+        'id',
+        'Cannot be empty.',
+      );
+    }
+
+    await FirebaseFirestore.instance.runTransaction((transaction) async {
+      final snapshot = await transaction.get(_ref);
+      final data = snapshot.data() ?? <String, dynamic>{};
+
+      final completed = List<String>.from(
+        data[field] ?? const <String>[],
+      );
+
+      if (completed.contains(id)) return;
+
+      final stars = data['stars'] is num
+          ? (data['stars'] as num).toInt()
+          : 0;
+
+      final update = <String, dynamic>{
+        field: FieldValue.arrayUnion([id]),
+        'stars': stars + awardStars,
+        'updatedAt': FieldValue.serverTimestamp(),
+      };
+
+      if (markPrayerDay) {
+        update['prayerDays'] =
+            FieldValue.arrayUnion([_todayKey()]);
+      }
+
+      transaction.set(
+        _ref,
+        update,
+        SetOptions(merge: true),
+      );
+    });
+  }
+
+  static String _todayKey() {
+    final now = DateTime.now();
+
+    return '${now.year.toString().padLeft(4, '0')}-'
+        '${now.month.toString().padLeft(2, '0')}-'
+        '${now.day.toString().padLeft(2, '0')}';
+  }
+}
+
+class KidsProgress {
+  final int stars;
+  final Set<String> completedLessons;
+  final Set<String> completedPrayers;
+  final Set<String> prayerDays;
+
+  const KidsProgress({
+    this.stars = 0,
+    this.completedLessons = const {},
+    this.completedPrayers = const {},
+    this.prayerDays = const {},
+  });
+
+  factory KidsProgress.fromMap(
+    DocumentSnapshot<Map<String, dynamic>> snapshot,
+  ) {
+    return KidsProgress.fromData(
+      snapshot.data() ?? const <String, dynamic>{},
+    );
+  }
+
+  factory KidsProgress.fromData(Map<String, dynamic> data) {
+    Set<String> readSet(String key) {
+      final value = data[key];
+
+      if (value is Iterable) {
+        return value.whereType<String>().toSet();
+      }
+
+      return <String>{};
+    }
+
+    return KidsProgress(
+      stars: data['stars'] is num
+          ? (data['stars'] as num).toInt()
+          : 0,
+      completedLessons: readSet('completedLessons'),
+      completedPrayers: readSet('completedPrayers'),
+      prayerDays: readSet('prayerDays'),
+    );
+  }
+
+  bool get firstPrayerBadge => completedPrayers.isNotEmpty;
+
+  bool get maryBadge => completedPrayers.length >= 2;
+
+  bool get rosaryBadge => completedPrayers.length >= 4;
+
+  bool get peacefulHeartBadge =>
+      completedLessons.length >= 4 &&
+      completedPrayers.length >= 3;
+
+  int get badges => [
+        firstPrayerBadge,
+        maryBadge,
+        rosaryBadge,
+        peacefulHeartBadge,
+      ].where((earned) => earned).length;
+}
+

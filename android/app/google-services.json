@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "167485172201",
+    "project_id": "smart-rosary-78b57",
+    "storage_bucket": "smart-rosary-78b57.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:167485172201:android:c47be996089f9acc9b0378",
+        "android_client_info": {
+          "package_name": "com.example.flutter_application_1"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "167485172201-j2og7d3r6f8koglg1ttt6uf3uvpitlhn.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCY17M4x1kIXl7WBQ2-oKfLswFO34D_Vns"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "167485172201-j2og7d3r6f8koglg1ttt6uf3uvpitlhn.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
